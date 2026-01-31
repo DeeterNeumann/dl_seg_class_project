@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.DS_Store
+
+# training artifacts / large outputs
+MoNuSAC_outputs/
+outputs/
+runs/
+checkpoints/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# data
+data/
+datasets/
+*.tif
+*.svs
+*.ndpi
+*.h5ad
+*.pkl
+*.npz
+*.npy
