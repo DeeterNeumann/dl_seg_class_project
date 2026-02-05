@@ -30,8 +30,8 @@ def _load_rgb(path: Path) -> torch.Tensor:
     Returns: float32 [3,H,W] in [0,1]
     """
     img = Image.open(path).convert("RGB")
-    arr = np.asarray(img, dtype=np.uint8)  # [H,W,3]
-    x = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+    arr = np.array(img, copy=True)  # ensures writable
+    x = torch.from_numpy(arr).permute(2,0,1).float() / 255.0
     return x
 
 

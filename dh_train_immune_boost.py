@@ -1,70 +1,361 @@
 """
+dh_train_immune_boost.py
+
 Shared SMP encoder + shared Unet decoder + 2 heads:
   - semantic head: 5 classes (MoNuSAC nucleus typing: 0..4)
   - ternary head:  3 classes (0=bg, 1=inside, 2=boundary)
 
 This script:
   - trains BOTH heads (semantic + ternary)
+  - supports systematic experiment runs (lambda_ter tuning, seed sweeps, fixed-budget mode)
   - prints epoch summaries with BOTH semantic + ternary metrics
   - writes metrics.csv + history.json
   - saves a single dashboard.png at the end
   - uses immune-aware WeightedRandomSampler logic
 
-Lightning-ready updates:
-  - Robust PROJECT_ROOT anchoring so assets/scripts resolve regardless of CWD
-  - TRAIN_MANIFEST / VAL_MANIFEST / BASE_DIR / OUT_ROOT / NUM_WORKERS via env vars
-  - Default OUT_ROOT="./outputs"
+Lightning-ready:
+  - Robust REPO_ROOT anchoring so assets/scripts resolve regardless of CWD
+  - DATA_ROOT / TRAIN_MANIFEST / VAL_MANIFEST / BASE_DIR / OUT_ROOT / NUM_WORKERS via env vars
+  - Default OUT_ROOT = "<repo>/outputs"
+
+NEW:
+  - Optional grid runner mode:
+      --grid
+      --grid_seeds 1337,2021,7
+      --grid_lambdas 0.25,0.5,1.0,2.0
+
+CRITICAL PATH FIXES:
+  - Auto-detect DATA_ROOT (prefers /team if present; falls back to /teamspace/...).
+  - Auto-resolve BASE_DIR by testing candidate roots against manifest paths.
+  - Hard preflight checks BEFORE spawning DataLoader workers (so you don't waste grid runs).
 """
 
+from __future__ import annotations
+
+import argparse
+import csv
 import json
+import os
+import sys
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+import random
+import traceback
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd  # <-- needed for fast manifest preflight
 
-import sys
-import os
-from dataclasses import dataclass
-import csv
-from datetime import datetime
-import random
+import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.base import SegmentationHead
 
 
 # -----------------------------
-# Project root + robust paths (Lightning-ready)
+# Repo root + robust imports
 # -----------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent  # script lives at repo root
+THIS_FILE = Path(__file__).resolve()
+if THIS_FILE.parent.name == "scripts":
+    REPO_ROOT = THIS_FILE.parent.parent
+else:
+    REPO_ROOT = THIS_FILE.parent
 
-# Ensure local imports (scripts/...) work from anywhere
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.export_manifest_dataset import ExportManifestDataset, ExportManifestConfig  # noqa: E402
 
 
-def env_path(key: str, default: str) -> str:
+# -----------------------------
+# CLI args
+# -----------------------------
+def _parse_csv_ints(s: str) -> list[int]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: list[int] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(tok))
+    return out
+
+
+def _parse_csv_floats(s: str) -> list[float]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: list[float] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(float(tok))
+    return out
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    # ---- Grid runner knobs ----
+    p.add_argument("--grid", action="store_true", help="Enable grid-runner (loops seeds x lambdas inside Python).")
+    p.add_argument("--grid_seeds", type=str, default="", help="Comma-separated seeds, e.g. 1337,2021,7")
+    p.add_argument("--grid_lambdas", type=str, default="", help="Comma-separated lambdas, e.g. 0.25,0.5,1.0,2.0")
+    p.add_argument("--grid_stop_on_fail", action="store_true", help="Stop grid immediately if a run fails.")
+    p.add_argument("--grid_continue_on_fail", action="store_true", help="Continue grid if a run fails (default).")
+
+    # Core experiment knobs
+    p.add_argument("--lambda_ter", type=float, default=1.0, help="Weight for ternary CE loss in total loss.")
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--run_prefix", type=str, default="DUALHEAD")
+    p.add_argument("--notes", type=str, default="")
+
+    # Fixed-budget mode for clean comparisons
+    p.add_argument(
+        "--fixed_epochs",
+        type=int,
+        default=0,
+        help="If >0, train exactly this many epochs (disables early-stop).",
+    )
+
+    # Common training knobs
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--max_epochs", type=int, default=1200)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--preview_every_steps", type=int, default=200)
+
+    # Monitor/selection controls
+    p.add_argument("--monitor_key", type=str, default="loss_total")
+    p.add_argument("--monitor_mode", type=str, default="min", choices=["min", "max"])
+    p.add_argument("--selection_key", type=str, default="ter_dice_macro_boundary")
+    p.add_argument("--selection_mode", type=str, default="max", choices=["min", "max"])
+
+    # Optional: override encoder
+    p.add_argument("--encoder", type=str, default="resnet34")
+    p.add_argument("--encoder_weights", type=str, default="imagenet")
+
+    # Debug/preflight knobs
+    p.add_argument("--preflight_rows", type=int, default=200, help="How many manifest rows to sample for path checks.")
+    p.add_argument("--preflight_fail_fast", action="store_true", help="If any missing file in sampled rows => fail fast.")
+
+    return p.parse_args()
+
+
+def maybe_get_git_commit() -> str | None:
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), stderr=subprocess.DEVNULL)
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return None
+
+
+def build_run_name(prefix: str, encoder: str, lam: float, seed: int) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lam_s = f"{lam:.3g}".replace(".", "p")
+    return f"{prefix}__{encoder}__lamTer{lam_s}__seed{seed}__{ts}"
+
+
+# -----------------------------
+# Env + path helpers
+# -----------------------------
+def env_str(key: str, default: str) -> str:
     v = os.environ.get(key, "").strip()
     return v if v else default
 
 
-def resolve_in_repo(p: str | Path) -> Path:
-    p = Path(p)
-    return p if p.is_absolute() else (PROJECT_ROOT / p)
+def _candidate_data_roots() -> list[Path]:
+    """
+    Prefer the location that historically worked for you (/team),
+    but still support Lightning Studio layout (/teamspace/...).
+    """
+    cands: list[Path] = []
+    # explicit env wins (but still validated)
+    v = os.environ.get("DATA_ROOT", "").strip()
+    if v:
+        cands.append(Path(v).resolve())
+
+    # common known roots
+    cands.extend(
+        [
+            Path("/team").resolve(),
+            Path("/teamspace/studios/this_studio/data/monusac_clean").resolve(),
+            Path("/teamspace/studios/this_studio/data/monusac").resolve(),
+            (REPO_ROOT / "data" / "monusac").resolve(),
+        ]
+    )
+
+    # de-dupe preserving order
+    seen = set()
+    out: list[Path] = []
+    for p in cands:
+        if str(p) in seen:
+            continue
+        seen.add(str(p))
+        out.append(p)
+    return out
 
 
-from scripts.export_manifest_dataset import ExportManifestDataset, ExportManifestConfig
-import segmentation_models_pytorch as smp
+def _default_data_root() -> Path:
+    """
+    Pick the first existing candidate that *looks like* it contains MoNuSAC_outputs.
+    """
+    for root in _candidate_data_roots():
+        if root.exists() and (root / "MoNuSAC_outputs").exists():
+            return root
+    # fallback: first existing root
+    for root in _candidate_data_roots():
+        if root.exists():
+            return root
+    # last resort: repo-relative
+    return (REPO_ROOT / "data" / "monusac").resolve()
+
+
+def _resolve_manifest_path(env_key: str, default_path: Path) -> Path:
+    v = os.environ.get(env_key, "").strip()
+    if v:
+        p = Path(v)
+        if not p.is_absolute():
+            p = (REPO_ROOT / p).resolve()
+        else:
+            p = p.resolve()
+        return p
+    return default_path.resolve()
+
+
+def _join_base(base_dir: Path, rel_or_abs: str) -> Path:
+    p = Path(str(rel_or_abs))
+    if p.is_absolute():
+        return p
+    return (base_dir / p).resolve()
+
+
+def _manifest_required_cols(df: pd.DataFrame) -> list[str]:
+    # what ExportManifestDataset uses (your traceback shows rgb_path specifically)
+    req = ["rgb_path", "sem_gt_path", "ter_gt_path"]
+    return [c for c in req if c not in df.columns]
+
+
+def _preflight_manifest_paths(
+    manifest_path: Path,
+    base_candidates: list[Path],
+    sample_rows: int = 200,
+    fail_fast: bool = False,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    Try candidate base dirs and pick the one that yields the highest existence rate
+    for rgb/sem/ter paths in a sampled subset of rows.
+    """
+    df = pd.read_csv(manifest_path)
+    missing_cols = _manifest_required_cols(df)
+    if missing_cols:
+        raise ValueError(f"Manifest missing columns {missing_cols}: {manifest_path}")
+
+    n = min(len(df), max(1, int(sample_rows)))
+    probe = df.head(n)
+
+    scored: list[tuple[float, Path, dict[str, Any]]] = []
+
+    for base in base_candidates:
+        if not base.exists():
+            continue
+
+        ok_rgb = 0
+        ok_sem = 0
+        ok_ter = 0
+        first_missing: dict[str, str] = {}
+
+        for i in range(n):
+            rgb = _join_base(base, probe.loc[i, "rgb_path"])
+            sem = _join_base(base, probe.loc[i, "sem_gt_path"])
+            ter = _join_base(base, probe.loc[i, "ter_gt_path"])
+
+            r_ok = rgb.exists()
+            s_ok = sem.exists()
+            t_ok = ter.exists()
+
+            ok_rgb += int(r_ok)
+            ok_sem += int(s_ok)
+            ok_ter += int(t_ok)
+
+            if fail_fast and (not (r_ok and s_ok and t_ok)):
+                if not r_ok and "rgb" not in first_missing:
+                    first_missing["rgb"] = str(rgb)
+                if not s_ok and "sem" not in first_missing:
+                    first_missing["sem"] = str(sem)
+                if not t_ok and "ter" not in first_missing:
+                    first_missing["ter"] = str(ter)
+                break
+
+            if not r_ok and "rgb" not in first_missing:
+                first_missing["rgb"] = str(rgb)
+            if not s_ok and "sem" not in first_missing:
+                first_missing["sem"] = str(sem)
+            if not t_ok and "ter" not in first_missing:
+                first_missing["ter"] = str(ter)
+
+        # score = mean existence across the three required files
+        score = (ok_rgb + ok_sem + ok_ter) / (3.0 * n)
+        details = {
+            "base_dir": str(base),
+            "sample_rows": int(n),
+            "rgb_ok": int(ok_rgb),
+            "sem_ok": int(ok_sem),
+            "ter_ok": int(ok_ter),
+            "score": float(score),
+            "first_missing": first_missing,
+        }
+        scored.append((score, base, details))
+
+    if not scored:
+        raise RuntimeError(
+            f"Preflight could not test any base_dir candidates (none exist). "
+            f"manifest={manifest_path}"
+        )
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_base, best_details = scored[0]
+
+    # If best score is poor, raise with strong diagnostics
+    if best_score < 0.95:
+        top = scored[:5]
+        msg_lines = [
+            f"[PATH PREFLIGHT] FAILED to find a base_dir with >=95% path existence.",
+            f"manifest: {manifest_path}",
+            f"sample_rows: {n}",
+            "Top candidates:",
+        ]
+        for s, b, det in top:
+            msg_lines.append(
+                f"  - score={s:.3f} base_dir={b} "
+                f"(rgb_ok={det['rgb_ok']}/{n}, sem_ok={det['sem_ok']}/{n}, ter_ok={det['ter_ok']}/{n})"
+            )
+            fm = det.get("first_missing") or {}
+            if fm:
+                msg_lines.append(f"      first_missing: {fm}")
+        msg_lines.append(
+            "Fix: set DATA_ROOT/BASE_DIR/TRAIN_MANIFEST/VAL_MANIFEST env vars to the correct location, "
+            "or ensure the export_patches files exist under the chosen root."
+        )
+        raise FileNotFoundError("\n".join(msg_lines))
+
+    return best_base, best_details
 
 
 # -----------------------------
 # Globals / constants
 # -----------------------------
-BASE_SEED = 1337
-
 SEMANTIC_CLASS_NAMES = {
     0: "background",
     1: "epithelial",
@@ -74,14 +365,13 @@ SEMANTIC_CLASS_NAMES = {
 }
 SEM_CLASSES = (0, 1, 2, 3, 4)
 
-TER_CLASS_NAMES = {
-    0: "bg",
-    1: "inside",
-    2: "boundary",
-}
+TER_CLASS_NAMES = {0: "bg", 1: "inside", 2: "boundary"}
 TER_CLASSES = (0, 1, 2)
 
-SEM_WEIGHTS_JSON = resolve_in_repo("assets/class_weights.json")
+SEM_WEIGHTS_JSON = (REPO_ROOT / "assets" / "class_weights.json").resolve()
+if not SEM_WEIGHTS_JSON.exists():
+    raise FileNotFoundError(f"Missing assets file: {SEM_WEIGHTS_JSON}")
+
 with open(SEM_WEIGHTS_JSON, "r", encoding="utf-8") as f:
     wobj = json.load(f)
 
@@ -154,10 +444,19 @@ def update_alias(alias_path: Path, target_path: Path):
     try:
         if alias_path.exists() or alias_path.is_symlink():
             alias_path.unlink()
-        alias_path.symlink_to(target_path.name)  # relative within same dir
+        alias_path.symlink_to(target_path.name)
     except OSError:
         import shutil
         shutil.copy2(target_path, alias_path)
+
+
+def safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
 # -----------------------------
@@ -210,19 +509,42 @@ def _dice_from_stats(inter, ps, gs, eps=1e-6):
     return (2 * inter + eps) / (ps + gs + eps)
 
 
+def _dice_micro_guarded(inter: torch.Tensor, ps: torch.Tensor, gs: torch.Tensor, eps: float = 1e-6) -> float:
+    gs_i = float(gs.item())
+    ps_i = float(ps.item())
+    if gs_i == 0.0 and ps_i == 0.0:
+        return float("nan")
+    if gs_i == 0.0 and ps_i > 0.0:
+        return 0.0
+    return float(_dice_from_stats(inter, ps, gs, eps).item())
+
+
+def _iou_micro_guarded(inter: torch.Tensor, union: torch.Tensor, eps: float = 1e-6) -> float:
+    if float(union.item()) == 0.0:
+        return float("nan")
+    return float(((inter + eps) / (union + eps)).item())
+
+
+def unpack_batch(batch):
+    if isinstance(batch, (list, tuple)):
+        if len(batch) < 3:
+            raise ValueError(f"Expected at least 3 items (x, sem, ter), got {len(batch)}")
+        return batch[0], batch[1], batch[2]
+    raise TypeError(f"Batch must be tuple/list, got {type(batch)}")
+
+
 @torch.no_grad()
-def semantic_dice_per_class(
-    sem_logits: torch.Tensor,   # [B,C,H,W]
-    sem_gt: torch.Tensor,       # [B,H,W]
+def semantic_dice_macro_per_class(
+    sem_logits: torch.Tensor,
+    sem_gt: torch.Tensor,
     classes=SEM_CLASSES,
     fg_only: bool = False,
     eps: float = 1e-6,
-):
-    pred = torch.argmax(sem_logits, dim=1)  # [B,H,W]
+) -> dict[int, float]:
+    pred = torch.argmax(sem_logits, dim=1)
     region = (sem_gt > 0) if fg_only else torch.ones_like(sem_gt, dtype=torch.bool)
 
-    dice_macro, dice_micro, class_counts = {}, {}, {}
-
+    dice_macro: dict[int, float] = {}
     for c in classes:
         per_img = []
         for b in range(pred.shape[0]):
@@ -233,28 +555,12 @@ def semantic_dice_per_class(
             inter, ps, gs = _bin_stats(pred_c, gt_c)
             per_img.append(_dice_from_stats(inter, ps, gs, eps))
         dice_macro[c] = float(torch.stack(per_img).mean().item()) if len(per_img) > 0 else 0.0
-
-        gt_c_all = (sem_gt == c) & region
-        pred_c_all = (pred == c) & region
-        inter, ps, gs = _bin_stats(pred_c_all, gt_c_all)
-        dice_micro[c] = float(_dice_from_stats(inter, ps, gs, eps).item())
-
-        class_counts[c] = {
-            "gt_pixels": int(gt_c_all.sum().item()),
-            "pred_pixels": int(pred_c_all.sum().item()),
-        }
-
-    return dice_macro, dice_micro, class_counts
+    return dice_macro
 
 
 @torch.no_grad()
-def semantic_iou_all(
-    sem_logits: torch.Tensor,  # [B,C,H,W]
-    sem_gt: torch.Tensor,      # [B,H,W]
-    classes=SEM_CLASSES,
-    eps: float = 1e-6,
-):
-    pred = torch.argmax(sem_logits, dim=1)  # [B,H,W]
+def semantic_iou_all(sem_logits: torch.Tensor, sem_gt: torch.Tensor, classes=SEM_CLASSES, eps: float = 1e-6):
+    pred = torch.argmax(sem_logits, dim=1)
     B = pred.shape[0]
 
     per_img_macro = []
@@ -271,9 +577,7 @@ def semantic_iou_all(
             inter = (pred_c & gt_c).sum().float()
             union = (pred_c | gt_c).sum().float()
             ious.append((inter + eps) / (union + eps))
-        per_img_macro.append(
-            torch.stack(ious).mean() if len(ious) > 0 else torch.tensor(0.0, device=pred.device)
-        )
+        per_img_macro.append(torch.stack(ious).mean() if len(ious) > 0 else torch.tensor(0.0, device=pred.device))
 
         for c in classes:
             gt_c = (sem_gt[b] == c)
@@ -281,30 +585,24 @@ def semantic_iou_all(
             inter_c[c] += (pred_c & gt_c).sum().float()
             union_c[c] += (pred_c | gt_c).sum().float()
 
-    miou_macro_per_img = torch.stack(per_img_macro)  # [B]
+    miou_macro_per_img = torch.stack(per_img_macro)
 
     total_inter = torch.zeros((), device=pred.device)
     total_union = torch.zeros((), device=pred.device)
-    iou_by_class_micro = {}
+    iou_by_class_micro: dict[int, float] = {}
     for c in classes:
         total_inter += inter_c[c]
         total_union += union_c[c]
-        iou_by_class_micro[c] = float(((inter_c[c] + eps) / (union_c[c] + eps)).item())
+        iou_by_class_micro[c] = _iou_micro_guarded(inter_c[c], union_c[c], eps=eps)
 
-    miou_micro = float(((total_inter + eps) / (total_union + eps)).item())
+    miou_micro = float(((total_inter + eps) / (total_union + eps)).item()) if float(total_union.item()) > 0 else float("nan")
     return miou_macro_per_img, miou_micro, iou_by_class_micro
 
 
 @torch.no_grad()
-def ternary_dice_per_class(
-    ter_logits: torch.Tensor,  # [B,3,H,W]
-    ter_gt: torch.Tensor,      # [B,H,W]
-    classes=TER_CLASSES,
-    eps: float = 1e-6,
-):
-    pred = torch.argmax(ter_logits, dim=1)  # [B,H,W]
-
-    dice_macro, dice_micro, class_counts = {}, {}, {}
+def ternary_dice_macro_per_class(ter_logits: torch.Tensor, ter_gt: torch.Tensor, classes=TER_CLASSES, eps: float = 1e-6):
+    pred = torch.argmax(ter_logits, dim=1)
+    dice_macro: dict[int, float] = {}
     for c in classes:
         per_img = []
         for b in range(pred.shape[0]):
@@ -315,28 +613,12 @@ def ternary_dice_per_class(
             inter, ps, gs = _bin_stats(pred_c, gt_c)
             per_img.append(_dice_from_stats(inter, ps, gs, eps))
         dice_macro[c] = float(torch.stack(per_img).mean().item()) if len(per_img) > 0 else 0.0
-
-        gt_c_all = (ter_gt == c)
-        pred_c_all = (pred == c)
-        inter, ps, gs = _bin_stats(pred_c_all, gt_c_all)
-        dice_micro[c] = float(_dice_from_stats(inter, ps, gs, eps).item())
-
-        class_counts[c] = {
-            "gt_pixels": int(gt_c_all.sum().item()),
-            "pred_pixels": int(pred_c_all.sum().item()),
-        }
-
-    return dice_macro, dice_micro, class_counts
+    return dice_macro
 
 
 @torch.no_grad()
-def ternary_iou_all(
-    ter_logits: torch.Tensor,  # [B,3,H,W]
-    ter_gt: torch.Tensor,      # [B,H,W]
-    classes=TER_CLASSES,
-    eps: float = 1e-6,
-):
-    pred = torch.argmax(ter_logits, dim=1)  # [B,H,W]
+def ternary_iou_all(ter_logits: torch.Tensor, ter_gt: torch.Tensor, classes=TER_CLASSES, eps: float = 1e-6):
+    pred = torch.argmax(ter_logits, dim=1)
     B = pred.shape[0]
 
     per_img_macro = []
@@ -353,9 +635,7 @@ def ternary_iou_all(
             inter = (pred_c & gt_c).sum().float()
             union = (pred_c | gt_c).sum().float()
             ious.append((inter + eps) / (union + eps))
-        per_img_macro.append(
-            torch.stack(ious).mean() if len(ious) > 0 else torch.tensor(0.0, device=pred.device)
-        )
+        per_img_macro.append(torch.stack(ious).mean() if len(ious) > 0 else torch.tensor(0.0, device=pred.device))
 
         for c in classes:
             gt_c = (ter_gt[b] == c)
@@ -363,17 +643,17 @@ def ternary_iou_all(
             inter_c[c] += (pred_c & gt_c).sum().float()
             union_c[c] += (pred_c | gt_c).sum().float()
 
-    miou_macro_per_img = torch.stack(per_img_macro)  # [B]
+    miou_macro_per_img = torch.stack(per_img_macro)
 
     total_inter = torch.zeros((), device=pred.device)
     total_union = torch.zeros((), device=pred.device)
-    iou_by_class_micro = {}
+    iou_by_class_micro: dict[int, float] = {}
     for c in classes:
         total_inter += inter_c[c]
         total_union += union_c[c]
-        iou_by_class_micro[c] = float(((inter_c[c] + eps) / (union_c[c] + eps)).item())
+        iou_by_class_micro[c] = _iou_micro_guarded(inter_c[c], union_c[c], eps=eps)
 
-    miou_micro = float(((total_inter + eps) / (total_union + eps)).item())
+    miou_micro = float(((total_inter + eps) / (total_union + eps)).item()) if float(total_union.item()) > 0 else float("nan")
     return miou_macro_per_img, miou_micro, iou_by_class_micro
 
 
@@ -381,14 +661,14 @@ def ternary_iou_all(
 # Losses
 # -----------------------------
 def multiclass_soft_dice_loss(
-    logits: torch.Tensor,          # [B,C,H,W]
-    target: torch.Tensor,          # [B,H,W]
+    logits: torch.Tensor,
+    target: torch.Tensor,
     num_classes: int,
     ignore_index: int | None = None,
-    class_weights: torch.Tensor | None = None,  # [C]
+    class_weights: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    probs = F.softmax(logits, dim=1)  # [B,C,H,W]
+    probs = F.softmax(logits, dim=1)
 
     if ignore_index is not None:
         valid = (target != ignore_index)
@@ -406,7 +686,7 @@ def multiclass_soft_dice_loss(
     dims = (0, 2, 3)
     inter = (probs * onehot).sum(dims)
     den = (probs + onehot).sum(dims)
-    dice = (2.0 * inter + eps) / (den + eps)  # [C]
+    dice = (2.0 * inter + eps) / (den + eps)
     loss_per_class = 1.0 - dice
 
     if class_weights is not None:
@@ -448,7 +728,11 @@ def append_metrics_row(path: Path, fieldnames: list[str], row: dict):
 def _fmt_per_class(d: dict, names: dict[int, str]) -> str:
     parts = []
     for c in sorted(d.keys()):
-        parts.append(f"{names.get(c, str(c))}:{d[c]:.4f}")
+        v = d[c]
+        if isinstance(v, float) and np.isnan(v):
+            parts.append(f"{names.get(c, str(c))}:nan")
+        else:
+            parts.append(f"{names.get(c, str(c))}:{float(v):.4f}")
     return " ".join(parts)
 
 
@@ -458,48 +742,7 @@ def _history_append(history: dict[str, list], row: dict, fieldnames: list[str]) 
         history[k].append(row.get(k, None))
 
 
-def save_preview_panel_dual(
-    out_path: Path,
-    x: torch.Tensor,
-    sem_gt: torch.Tensor,
-    sem_logits: torch.Tensor,
-    ter_gt: torch.Tensor,
-    ter_logits: torch.Tensor,
-    b: int = 0,
-):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    img = x[b].detach().cpu().numpy()
-    img = np.transpose(img, (1, 2, 0))
-    img = np.clip(img, 0, 1)
-
-    sem_gt_np = sem_gt[b].detach().cpu().numpy()
-    sem_pred = torch.argmax(sem_logits[b], dim=0).detach().cpu().numpy()
-
-    ter_gt_np = ter_gt[b].detach().cpu().numpy()
-    ter_pred = torch.argmax(ter_logits[b], dim=0).detach().cpu().numpy()
-
-    fig, ax = plt.subplots(1, 5, figsize=(18, 4))
-    ax[0].imshow(img); ax[0].set_title("RGB"); ax[0].axis("off")
-    ax[1].imshow(sem_gt_np); ax[1].set_title("SEM GT (0-4)"); ax[1].axis("off")
-    ax[2].imshow(sem_pred); ax[2].set_title("SEM Pred"); ax[2].axis("off")
-    ax[3].imshow(ter_gt_np); ax[3].set_title("TER GT (0-2)"); ax[3].axis("off")
-    ax[4].imshow(ter_pred); ax[4].set_title("TER Pred"); ax[4].axis("off")
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
 def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
-    """
-    Single dashboard figure (3x2):
-      [0,0] Losses (semantic + ternary)
-      [0,1] Semantic mIoU (macro+micro)
-      [1,0] Semantic Dice (macro) by class
-      [1,1] Semantic IoU (micro) by class
-      [2,0] LR
-      [2,1] Ternary mIoU (macro+micro)
-    """
     epochs = history.get("epoch", [])
     if not epochs or len(epochs) < 2:
         return
@@ -513,8 +756,11 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
             if v is None or v == "":
                 continue
             try:
+                fv = float(v)
+                if np.isnan(fv):
+                    continue
                 xs.append(int(e))
-                ys.append(float(v))
+                ys.append(fv)
             except Exception:
                 continue
         return xs, ys
@@ -536,26 +782,17 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
 
     _plot_lines(
         axs[0, 0],
-        [
-            "train_loss_total",
-            "val_loss_total",
-            "train_loss_sem",
-            "val_loss_sem",
-            "train_loss_ter",
-            "val_loss_ter",
-        ],
+        ["train_loss_total", "val_loss_total", "train_loss_sem", "val_loss_sem", "train_loss_ter", "val_loss_ter"],
         "Loss (total + per-head)",
         "loss",
     )
-
     _plot_lines(axs[0, 1], ["miou_all_macro", "miou_all_micro"], "Semantic mIoU", "IoU")
 
     ax = axs[1, 0]
     any_plotted = False
     for c in SEM_CLASSES:
         nm = SEMANTIC_CLASS_NAMES[c]
-        k = f"dice_macro_{nm}"
-        xs, ys = _series(k)
+        xs, ys = _series(f"dice_macro_{nm}")
         if len(xs) >= 2:
             ax.plot(xs, ys, label=nm)
             any_plotted = True
@@ -569,8 +806,7 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
     any_plotted = False
     for c in SEM_CLASSES:
         nm = SEMANTIC_CLASS_NAMES[c]
-        k = f"iou_{nm}"
-        xs, ys = _series(k)
+        xs, ys = _series(f"iou_{nm}")
         if len(xs) >= 2:
             ax.plot(xs, ys, label=nm)
             any_plotted = True
@@ -591,14 +827,14 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
 
 
 # -----------------------------
-# Plateau stopper (monitor-based)
+# Plateau stopper
 # -----------------------------
 @dataclass
 class PlateauStopper:
     patience: int = 80
     min_delta: float = 5e-4
     min_epochs: int = 120
-    mode: str = "min"  # "min" or "max"
+    mode: str = "min"
     ema_alpha: float = 0.3
 
     best: float = float("inf")
@@ -621,13 +857,7 @@ class PlateauStopper:
             self.bad_epochs += 1
 
         should_stop = (epoch >= self.min_epochs) and (self.bad_epochs >= self.patience)
-        info = {
-            "raw": float(value),
-            "smoothed": float(v),
-            "best": float(self.best),
-            "bad_epochs": int(self.bad_epochs),
-            "patience": int(self.patience),
-        }
+        info = {"raw": float(value), "smoothed": float(v), "best": float(self.best), "bad_epochs": int(self.bad_epochs), "patience": int(self.patience)}
         return should_stop, info
 
 
@@ -635,15 +865,6 @@ class PlateauStopper:
 # Model: shared encoder+decoder, two heads
 # -----------------------------
 class SharedUnetTwoHead(nn.Module):
-    """
-    Version-robust dual-head U-Net:
-      - shared SMP Unet encoder+decoder
-      - two segmentation heads on top of decoder output
-
-    Returns:
-      sem_logits: [B, sem_classes, H, W]
-      ter_logits: [B, ter_classes, H, W]
-    """
     def __init__(
         self,
         encoder_name: str = "resnet34",
@@ -655,32 +876,18 @@ class SharedUnetTwoHead(nn.Module):
         activation=None,
     ):
         super().__init__()
-
         self.decoder_channels = tuple(decoder_channels)
-
         self.base = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
-            classes=1,  # dummy
+            classes=1,
             activation=None,
             decoder_channels=self.decoder_channels,
         )
-
         dec_out_ch = self.decoder_channels[-1]
-
-        self.sem_head = smp.base.SegmentationHead(
-            in_channels=dec_out_ch,
-            out_channels=sem_classes,
-            activation=activation,
-            kernel_size=3,
-        )
-        self.ter_head = smp.base.SegmentationHead(
-            in_channels=dec_out_ch,
-            out_channels=ter_classes,
-            activation=activation,
-            kernel_size=3,
-        )
+        self.sem_head = SegmentationHead(in_channels=dec_out_ch, out_channels=sem_classes, activation=activation, kernel_size=3)
+        self.ter_head = SegmentationHead(in_channels=dec_out_ch, out_channels=ter_classes, activation=activation, kernel_size=3)
 
     def forward(self, x: torch.Tensor):
         feats = self.base.encoder(x)
@@ -716,53 +923,41 @@ def evaluate(
     total_loss_sum = 0.0
     n = 0
 
-    dice_macro_sum = {c: 0.0 for c in SEM_CLASSES}
-    dice_micro_sum = {c: 0.0 for c in SEM_CLASSES}
+    sem_dice_macro_sum = {c: 0.0 for c in SEM_CLASSES}
+    ter_dice_macro_sum = {c: 0.0 for c in TER_CLASSES}
     n_batches = 0
+
+    sem_inter_c = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
+    sem_ps_c = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
+    sem_gs_c = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
+    sem_union_c = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
+
+    ter_inter_c = {c: torch.zeros((), device=device) for c in TER_CLASSES}
+    ter_ps_c = {c: torch.zeros((), device=device) for c in TER_CLASSES}
+    ter_gs_c = {c: torch.zeros((), device=device) for c in TER_CLASSES}
+    ter_union_c = {c: torch.zeros((), device=device) for c in TER_CLASSES}
+
+    total_inter_all = torch.zeros((), device=device)
+    total_union_all = torch.zeros((), device=device)
 
     miou_all_macro_img_sum = 0.0
     n_all_imgs = 0
-    total_inter_all = torch.zeros((), device=device)
-    total_union_all = torch.zeros((), device=device)
-    inter_c_sum = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
-    union_c_sum = {c: torch.zeros((), device=device) for c in SEM_CLASSES}
-    gt_pixels_sum = {c: 0 for c in SEM_CLASSES}
-    pr_pixels_sum = {c: 0 for c in SEM_CLASSES}
-
-    ter_dice_macro_sum = {c: 0.0 for c in TER_CLASSES}
-    ter_dice_micro_sum = {c: 0.0 for c in TER_CLASSES}
-    ter_gt_pixels_sum = {c: 0 for c in TER_CLASSES}
-    ter_pr_pixels_sum = {c: 0 for c in TER_CLASSES}
-    ter_n_batches = 0
-
     ter_miou_macro_img_sum = 0.0
     n_ter_imgs = 0
-    ter_total_inter = torch.zeros((), device=device)
-    ter_total_union = torch.zeros((), device=device)
-    ter_inter_c_sum = {c: torch.zeros((), device=device) for c in TER_CLASSES}
-    ter_union_c_sum = {c: torch.zeros((), device=device) for c in TER_CLASSES}
 
-    for x, sem, ter in dl:
+    for batch in dl:
+        x, sem, ter = unpack_batch(batch)
         x = x.to(device)
         sem = sem.to(device)
         ter = ter.to(device)
 
         sem_logits, ter_logits = model(x)
 
-        sem_loss, _ = semantic_loss_dice_only(
-            sem_logits,
-            sem,
-            dice_w=sem_dice_w,
-            ignore_index=ignore_index_sem,
-        )
-
-        ter_loss = F.cross_entropy(
-            ter_logits,
-            ter,
-            weight=ter_ce_w,
-            reduction="mean",
-            ignore_index=ignore_index_ter if ignore_index_ter is not None else -100,
-        )
+        sem_loss, _ = semantic_loss_dice_only(sem_logits, sem, dice_w=sem_dice_w, ignore_index=ignore_index_sem)
+        if ignore_index_ter is None:
+            ter_loss = F.cross_entropy(ter_logits, ter, weight=ter_ce_w, reduction="mean")
+        else:
+            ter_loss = F.cross_entropy(ter_logits, ter, weight=ter_ce_w, reduction="mean", ignore_index=ignore_index_ter)
 
         total = sem_loss + float(ter_loss_weight) * ter_loss
 
@@ -776,156 +971,165 @@ def evaluate(
         miou_all_macro_img_sum += float(miou_per_img.sum().item())
         n_all_imgs += int(miou_per_img.numel())
 
-        sem_pred = torch.argmax(sem_logits, dim=1)
-        batch_inter_all = torch.zeros((), device=device)
-        batch_union_all = torch.zeros((), device=device)
-        for c in SEM_CLASSES:
-            gt_c = (sem == c)
-            pr_c = (sem_pred == c)
-            inter = (gt_c & pr_c).sum().float()
-            union = (gt_c | pr_c).sum().float()
-            inter_c_sum[c] += inter
-            union_c_sum[c] += union
-            batch_inter_all += inter
-            batch_union_all += union
-        total_inter_all += batch_inter_all
-        total_union_all += batch_union_all
-
-        dm, di, cc = semantic_dice_per_class(sem_logits, sem, classes=SEM_CLASSES, fg_only=dice_fg_only, eps=eps)
-        for c in SEM_CLASSES:
-            dice_macro_sum[c] += dm[c]
-            dice_micro_sum[c] += di[c]
-            gt_pixels_sum[c] += int(cc[c]["gt_pixels"])
-            pr_pixels_sum[c] += int(cc[c]["pred_pixels"])
-        n_batches += 1
-
         ter_miou_per_img, _ter_miou_micro_unused, _ = ternary_iou_all(ter_logits, ter, classes=TER_CLASSES, eps=eps)
         ter_miou_macro_img_sum += float(ter_miou_per_img.sum().item())
         n_ter_imgs += int(ter_miou_per_img.numel())
 
+        dm = semantic_dice_macro_per_class(sem_logits, sem, classes=SEM_CLASSES, fg_only=dice_fg_only, eps=eps)
+        tdm = ternary_dice_macro_per_class(ter_logits, ter, classes=TER_CLASSES, eps=eps)
+        for c in SEM_CLASSES:
+            sem_dice_macro_sum[c] += float(dm[c])
+        for c in TER_CLASSES:
+            ter_dice_macro_sum[c] += float(tdm[c])
+        n_batches += 1
+
+        sem_pred = torch.argmax(sem_logits, dim=1)
+        for c in SEM_CLASSES:
+            gt_c = (sem == c)
+            pr_c = (sem_pred == c)
+            inter = (gt_c & pr_c).sum().float()
+            ps = pr_c.sum().float()
+            gs = gt_c.sum().float()
+            union = (gt_c | pr_c).sum().float()
+            sem_inter_c[c] += inter
+            sem_ps_c[c] += ps
+            sem_gs_c[c] += gs
+            sem_union_c[c] += union
+            total_inter_all += inter
+            total_union_all += union
+
         ter_pred = torch.argmax(ter_logits, dim=1)
-        batch_inter_ter = torch.zeros((), device=device)
-        batch_union_ter = torch.zeros((), device=device)
         for c in TER_CLASSES:
             gt_c = (ter == c)
             pr_c = (ter_pred == c)
             inter = (gt_c & pr_c).sum().float()
+            ps = pr_c.sum().float()
+            gs = gt_c.sum().float()
             union = (gt_c | pr_c).sum().float()
-            ter_inter_c_sum[c] += inter
-            ter_union_c_sum[c] += union
-            batch_inter_ter += inter
-            batch_union_ter += union
-        ter_total_inter += batch_inter_ter
-        ter_total_union += batch_union_ter
-
-        tdm, tdi, tcc = ternary_dice_per_class(ter_logits, ter, classes=TER_CLASSES, eps=eps)
-        for c in TER_CLASSES:
-            ter_dice_macro_sum[c] += tdm[c]
-            ter_dice_micro_sum[c] += tdi[c]
-            ter_gt_pixels_sum[c] += int(tcc[c]["gt_pixels"])
-            ter_pr_pixels_sum[c] += int(tcc[c]["pred_pixels"])
-        ter_n_batches += 1
+            ter_inter_c[c] += inter
+            ter_ps_c[c] += ps
+            ter_gs_c[c] += gs
+            ter_union_c[c] += union
 
     out: dict[str, Any] = {}
-
     out["loss_sem"] = sem_loss_sum / max(1, n)
     out["loss_ter"] = ter_loss_sum / max(1, n)
     out["loss_total"] = total_loss_sum / max(1, n)
 
     out["miou_all_macro"] = miou_all_macro_img_sum / max(1, n_all_imgs)
-    out["miou_all_micro"] = float(((total_inter_all + eps) / (total_union_all + eps)).item())
+    out["miou_all_micro"] = float(((total_inter_all + eps) / (total_union_all + eps)).item()) if float(total_union_all.item()) > 0 else float("nan")
 
     for c in SEM_CLASSES:
         nm = SEMANTIC_CLASS_NAMES[c]
-        out[f"iou_{nm}"] = float(((inter_c_sum[c] + eps) / (union_c_sum[c] + eps)).item())
-        out[f"dice_macro_{nm}"] = dice_macro_sum[c] / max(1, n_batches)
-        out[f"dice_micro_{nm}"] = dice_micro_sum[c] / max(1, n_batches)
-        out[f"gt_pixels_{nm}"] = gt_pixels_sum[c]
-        out[f"pred_pixels_{nm}"] = pr_pixels_sum[c]
+        out[f"iou_{nm}"] = _iou_micro_guarded(sem_inter_c[c], sem_union_c[c], eps=eps)
+        out[f"dice_macro_{nm}"] = sem_dice_macro_sum[c] / max(1, n_batches)
+        out[f"dice_micro_{nm}"] = _dice_micro_guarded(sem_inter_c[c], sem_ps_c[c], sem_gs_c[c], eps=eps)
+        out[f"gt_pixels_{nm}"] = int(sem_gs_c[c].item())
+        out[f"pred_pixels_{nm}"] = int(sem_ps_c[c].item())
 
-    out["dice_macro_by_class"] = {c: dice_macro_sum[c] / max(1, n_batches) for c in SEM_CLASSES}
-    out["dice_micro_by_class"] = {c: dice_micro_sum[c] / max(1, n_batches) for c in SEM_CLASSES}
+    out["dice_macro_by_class"] = {c: sem_dice_macro_sum[c] / max(1, n_batches) for c in SEM_CLASSES}
+    out["dice_micro_by_class"] = {c: _dice_micro_guarded(sem_inter_c[c], sem_ps_c[c], sem_gs_c[c], eps=eps) for c in SEM_CLASSES}
+
+    ter_total_inter = torch.zeros((), device=device)
+    ter_total_union = torch.zeros((), device=device)
+    for c in TER_CLASSES:
+        ter_total_inter += ter_inter_c[c]
+        ter_total_union += ter_union_c[c]
 
     out["ter_miou_macro"] = ter_miou_macro_img_sum / max(1, n_ter_imgs)
-    out["ter_miou_micro"] = float(((ter_total_inter + eps) / (ter_total_union + eps)).item())
+    out["ter_miou_micro"] = float(((ter_total_inter + eps) / (ter_total_union + eps)).item()) if float(ter_total_union.item()) > 0 else float("nan")
 
     for c in TER_CLASSES:
         nm = TER_CLASS_NAMES[c]
-        out[f"ter_iou_{nm}"] = float(((ter_inter_c_sum[c] + eps) / (ter_union_c_sum[c] + eps)).item())
-        out[f"ter_dice_macro_{nm}"] = ter_dice_macro_sum[c] / max(1, ter_n_batches)
-        out[f"ter_dice_micro_{nm}"] = ter_dice_micro_sum[c] / max(1, ter_n_batches)
-        out[f"ter_gt_pixels_{nm}"] = ter_gt_pixels_sum[c]
-        out[f"ter_pred_pixels_{nm}"] = ter_pr_pixels_sum[c]
+        out[f"ter_iou_{nm}"] = _iou_micro_guarded(ter_inter_c[c], ter_union_c[c], eps=eps)
+        out[f"ter_dice_macro_{nm}"] = ter_dice_macro_sum[c] / max(1, n_batches)
+        out[f"ter_dice_micro_{nm}"] = _dice_micro_guarded(ter_inter_c[c], ter_ps_c[c], ter_gs_c[c], eps=eps)
+        out[f"ter_gt_pixels_{nm}"] = int(ter_gs_c[c].item())
+        out[f"ter_pred_pixels_{nm}"] = int(ter_ps_c[c].item())
 
-    out["ter_dice_macro_by_class"] = {c: ter_dice_macro_sum[c] / max(1, ter_n_batches) for c in TER_CLASSES}
-    out["ter_dice_micro_by_class"] = {c: ter_dice_micro_sum[c] / max(1, ter_n_batches) for c in TER_CLASSES}
+    out["ter_dice_macro_by_class"] = {c: ter_dice_macro_sum[c] / max(1, n_batches) for c in TER_CLASSES}
+    out["ter_dice_micro_by_class"] = {c: _dice_micro_guarded(ter_inter_c[c], ter_ps_c[c], ter_gs_c[c], eps=eps) for c in TER_CLASSES}
 
     return out
 
 
 # -----------------------------
-# Main
+# Single-run main logic
 # -----------------------------
-def main():
-    seed_everything(BASE_SEED)
+def run_single(args: argparse.Namespace) -> dict[str, Any]:
+    seed_everything(args.seed)
 
-    # Hyperparams
-    batch_size = 8
-    lr = 1e-4
-    max_epochs = 1200
-    weight_decay = 1e-4
-    TER_LOSS_WEIGHT = 1.0  # total_loss = sem_loss + TER_LOSS_WEIGHT * ter_loss
+    batch_size = int(args.batch_size)
+    lr = float(args.lr)
+    max_epochs = int(args.max_epochs)
+    weight_decay = float(args.weight_decay)
+    TER_LOSS_WEIGHT = float(args.lambda_ter)
 
-    MONITOR_KEY = "loss_total"
-    MONITOR_MODE = "min"
+    MONITOR_KEY = str(args.monitor_key)
+    MONITOR_MODE = str(args.monitor_mode)
+    SELECTION_KEY = str(args.selection_key)
+    SELECTION_MODE = str(args.selection_mode)
 
-    SELECTION_KEY = "miou_all_macro"
-    SELECTION_MODE = "max"
+    PREVIEW_EVERY_STEPS = int(args.preview_every_steps)
 
-    plateau_patience = 20
-    plateau_min_delta = 5e-4
-    plateau_min_epochs = 120
+    ENCODER = str(args.encoder)
+    ENCODER_WEIGHTS = str(args.encoder_weights) if args.encoder_weights else None
 
-    PREVIEW_EVERY_STEPS = 200
+    # ---- ROOTS & MANIFESTS (robust) ----
+    data_root_default = _default_data_root()
+    DATA_ROOT = Path(env_str("DATA_ROOT", str(data_root_default))).resolve()
 
-    ENCODER = "resnet34"
-    ENCODER_WEIGHTS = "imagenet"
+    train_manifest_default = DATA_ROOT / "MoNuSAC_outputs/export_patches/train_P256_S128_fg0.01/export_manifest_immune_counts.csv"
+    val_manifest_default = DATA_ROOT / "MoNuSAC_outputs/export_patches/val_P256_S128_fg0.01/export_manifest_immune_counts.csv"
+    train_manifest_path = _resolve_manifest_path("TRAIN_MANIFEST", train_manifest_default)
+    val_manifest_path = _resolve_manifest_path("VAL_MANIFEST", val_manifest_default)
 
-    # -----------------------------
-    # Data (Lightning-ready)
-    # -----------------------------
-    train_manifest = env_path(
-        "TRAIN_MANIFEST",
-        "MoNuSAC_outputs/export_patches/train_P256_S128_fg0.01/export_manifest_immune_counts.csv",
+    # Base candidates include: BASE_DIR env if set, DATA_ROOT, parent of manifest, /team, /teamspace/... and REPO_ROOT
+    base_candidates: list[Path] = []
+    base_env = os.environ.get("BASE_DIR", "").strip()
+    if base_env:
+        base_candidates.append(Path(base_env).resolve())
+    base_candidates.extend([DATA_ROOT, train_manifest_path.parent.parent.parent.parent, val_manifest_path.parent.parent.parent.parent])
+    base_candidates.extend(_candidate_data_roots())
+    base_candidates.append(REPO_ROOT)
+
+    # De-dupe
+    seen = set()
+    deduped: list[Path] = []
+    for p in base_candidates:
+        pr = p.resolve()
+        if str(pr) in seen:
+            continue
+        seen.add(str(pr))
+        deduped.append(pr)
+    base_candidates = deduped
+
+    # Preflight to find a working BASE_DIR that matches manifest paths
+    base_dir_train, train_pf = _preflight_manifest_paths(
+        train_manifest_path,
+        base_candidates,
+        sample_rows=int(args.preflight_rows),
+        fail_fast=bool(args.preflight_fail_fast),
     )
-    val_manifest = env_path(
-        "VAL_MANIFEST",
-        "MoNuSAC_outputs/export_patches/val_P256_S128_fg0.01/export_manifest_immune_counts.csv",
+    base_dir_val, val_pf = _preflight_manifest_paths(
+        val_manifest_path,
+        base_candidates,
+        sample_rows=int(args.preflight_rows),
+        fail_fast=bool(args.preflight_fail_fast),
     )
 
-    train_manifest_path = resolve_in_repo(train_manifest)
-    val_manifest_path = resolve_in_repo(val_manifest)
+    # If they disagree, choose the better score (they should both be ~1.0 if correct)
+    base_dir = base_dir_train
+    if val_pf["score"] > train_pf["score"]:
+        base_dir = base_dir_val
 
-    base_dir = env_path("BASE_DIR", str(PROJECT_ROOT))
+    device = get_device()
 
-    if not train_manifest_path.exists():
-        raise FileNotFoundError(
-            f"TRAIN_MANIFEST not found: {train_manifest_path}\n"
-            f"Set TRAIN_MANIFEST to an absolute path or a repo-relative path."
-        )
-    if not val_manifest_path.exists():
-        raise FileNotFoundError(
-            f"VAL_MANIFEST not found: {val_manifest_path}\n"
-            f"Set VAL_MANIFEST to an absolute path or a repo-relative path."
-        )
+    out_root = Path(env_str("OUT_ROOT", str(REPO_ROOT / "outputs")))
+    out_root = out_root if out_root.is_absolute() else (REPO_ROOT / out_root)
+    out_root = out_root.resolve()
 
-    # -----------------------------
-    # Outputs (Lightning-ready)
-    # -----------------------------
-    out_root = resolve_in_repo(env_path("OUT_ROOT", "outputs"))
-
-    tag = f"DUALHEAD__{ENCODER}__monitor_{MONITOR_KEY}__select_{SELECTION_KEY}"
-    run_name = f"{tag}__{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = build_run_name(args.run_prefix, ENCODER, TER_LOSS_WEIGHT, args.seed)
 
     ckpt_dir = out_root / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -938,43 +1142,33 @@ def main():
     metrics_csv = runs_dir / "metrics.csv"
     config_json = runs_dir / "config.json"
 
-    preview_dir = out_root / "preview" / run_name
-    preview_dir.mkdir(parents=True, exist_ok=True)
-
     if metrics_csv.exists():
         metrics_csv.unlink()
 
-    # Device + determinism
-    device = get_device()
-    print("device:", device)
-    print("[PROJECT_ROOT]", PROJECT_ROOT)
-    print("[OUT_ROOT]", out_root.resolve())
-    print("[SEM_WEIGHTS_JSON]", SEM_WEIGHTS_JSON, "exists=", SEM_WEIGHTS_JSON.exists())
+    print(f"\n[RUN] {run_name}")
+    print(f"[RUN] device={device} seed={args.seed} lambda_ter={TER_LOSS_WEIGHT} fixed_epochs={int(args.fixed_epochs)}")
+    print(f"[PATH] DATA_ROOT={DATA_ROOT}")
+    print(f"[PATH] TRAIN_MANIFEST={train_manifest_path}")
+    print(f"[PATH] VAL_MANIFEST={val_manifest_path}")
+    print(f"[PATH] BASE_DIR(resolved)={base_dir}")
+    print(f"[PREFLIGHT] train score={train_pf['score']:.3f} val score={val_pf['score']:.3f}")
+    print(f"[OUT] out_root={out_root}")
 
     torch.use_deterministic_algorithms(True, warn_only=True)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
-    # DataLoader performance knobs
-    num_workers = int(env_path("NUM_WORKERS", "4"))
+    num_workers = int(env_str("NUM_WORKERS", "4"))
     pin_memory = (device.type == "cuda")
     persistent_workers = (num_workers > 0)
 
-    # Data
-    train_data_config = ExportManifestConfig(str(train_manifest_path), base_dir=base_dir)
-    val_data_config = ExportManifestConfig(str(val_manifest_path), base_dir=base_dir)
+    train_data_config = ExportManifestConfig(csv_path=train_manifest_path, base_dir=base_dir)
+    val_data_config = ExportManifestConfig(csv_path=val_manifest_path, base_dir=base_dir)
     train_ds = ExportManifestDataset(train_data_config)
     val_ds = ExportManifestDataset(val_data_config)
 
-    # Semantic weights (optional) — used here as Dice class weights if you want
-    sem_w = torch.tensor(wobj["weights"], dtype=torch.float32, device=device)
-    sem_w = sem_w.clone()
-    sem_w[3] = min(sem_w[3].item(), 6.0)  # neutrophil cap
-    sem_w[4] = min(sem_w[4].item(), 2.0)  # macrophage cap
-    print("[sem weights (capped)]", sem_w.detach().cpu().numpy().tolist())
-
-    # ---- class-aware immune sampling (TRAIN ONLY) ----
+    # ---- immune-aware sampler ----
     req_cols = ["px_lymphocyte", "px_neutrophil", "px_macrophage"]
     missing = [c for c in req_cols if c not in train_ds.df.columns]
     if missing:
@@ -984,10 +1178,7 @@ def main():
     px_neu = train_ds.df["px_neutrophil"].to_numpy(dtype=np.int64)
     px_mac = train_ds.df["px_macrophage"].to_numpy(dtype=np.int64)
 
-    T_LYM = 25
-    T_NEU = 10
-    T_MAC = 10
-
+    T_LYM, T_NEU, T_MAC = 25, 10, 10
     has_lym = px_lym >= T_LYM
     has_neu = px_neu >= T_NEU
     has_mac = px_mac >= T_MAC
@@ -997,40 +1188,16 @@ def main():
     weights[has_neu] *= 8.0
     weights[has_mac] *= 8.0
     weights[has_neu & has_mac] *= 1.5
-
     weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
     weights = np.clip(weights, 1e-8, None)
 
     print(
-        f"[class-sampler] has_lym={has_lym.mean():.2%} "
-        f"has_neu={has_neu.mean():.2%} has_mac={has_mac.mean():.2%} "
+        f"[SAMPLER] has_lym={has_lym.mean():.2%} has_neu={has_neu.mean():.2%} has_mac={has_mac.mean():.2%} "
         f"(T_LYM={T_LYM}, T_NEU={T_NEU}, T_MAC={T_MAC})"
     )
 
-    train_sampler = WeightedRandomSampler(
-        weights=torch.as_tensor(weights, dtype=torch.double),
-        num_samples=len(weights),
-        replacement=True,
-    )
+    train_sampler = WeightedRandomSampler(weights=weights.tolist(), num_samples=len(weights), replacement=True)
 
-    # Probe val batch for sanity + preview monitor
-    val_probe_dl = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
-    x0, sem0, ter0 = next(iter(val_probe_dl))
-    print("[SEM] unique class ids in GT:", torch.unique(sem0).cpu().tolist())
-    print("[TER] unique class ids in GT:", torch.unique(ter0).cpu().tolist())
-
-    monitor_x = x0.to(device)
-    monitor_sem = sem0.to(device)
-    monitor_ter = ter0.to(device)
-
-    # Model (dual-head)
     model = SharedUnetTwoHead(
         encoder_name=ENCODER,
         encoder_weights=ENCODER_WEIGHTS,
@@ -1041,86 +1208,79 @@ def main():
         activation=None,
     ).to(device)
 
-    # Config logging
     config = {
         "run_name": run_name,
-        "seed": int(BASE_SEED),
+        "run_prefix": str(args.run_prefix),
+        "notes": str(args.notes),
+        "git_commit": maybe_get_git_commit(),
+        "seed": int(args.seed),
+        "lambda_ter": float(TER_LOSS_WEIGHT),
+        "fixed_epochs": int(args.fixed_epochs),
         "device": str(device),
-        "max_epochs": int(max_epochs),
         "batch_size": int(batch_size),
         "lr_init": float(lr),
         "weight_decay": float(weight_decay),
+        "max_epochs": int(max_epochs),
+        "preview_every_steps": int(PREVIEW_EVERY_STEPS),
         "encoder": ENCODER,
         "encoder_weights": ENCODER_WEIGHTS,
-        "ter_loss_weight": float(TER_LOSS_WEIGHT),
         "monitor_key": MONITOR_KEY,
         "monitor_mode": MONITOR_MODE,
         "selection_key": SELECTION_KEY,
         "selection_mode": SELECTION_MODE,
+        "data_root": str(DATA_ROOT),
         "train_manifest": str(train_manifest_path),
         "val_manifest": str(val_manifest_path),
         "base_dir": str(base_dir),
-        "sem_weights_json": str(SEM_WEIGHTS_JSON),
-        "out_root": str(out_root.resolve()),
-        "preview_every_steps": int(PREVIEW_EVERY_STEPS),
+        "out_root": str(out_root),
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
-        "ternary_encoding": {"0": "background", "1": "inside", "2": "boundary(inner)"},
+        "preflight": {"train": train_pf, "val": val_pf},
     }
     config_json.write_text(json.dumps(config, indent=2))
 
-    # Optimizer + scheduler + stopper
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt,
         mode="min" if MONITOR_MODE == "min" else "max",
         factor=0.5,
         patience=20,
-        threshold=plateau_min_delta,
+        threshold=5e-4,
     )
 
     stopper = PlateauStopper(
-        patience=3 * plateau_patience,
-        min_delta=plateau_min_delta,
-        min_epochs=plateau_min_epochs,
+        patience=240,
+        min_delta=5e-4,
+        min_epochs=120,
         mode=MONITOR_MODE,
         ema_alpha=0.3,
     )
 
-    # Metrics schema
     metric_fields = [
         "epoch", "global_step",
         "train_loss_sem", "train_loss_ter", "train_loss_total",
         "val_loss_sem", "val_loss_ter", "val_loss_total",
         "miou_all_macro", "miou_all_micro",
         "ter_miou_macro", "ter_miou_micro",
-        "monitor_value",
-        "selection_value",
-        "plateau_raw", "plateau_ema", "plateau_best", "plateau_bad_epochs", "plateau_patience",
+        "monitor_value", "selection_value",
         "should_stop", "lr",
+        "lambda_ter", "seed",
     ]
-
     for c in SEM_CLASSES:
         nm = SEMANTIC_CLASS_NAMES[c]
-        metric_fields += [
-            f"iou_{nm}",
-            f"dice_macro_{nm}", f"dice_micro_{nm}",
-            f"gt_pixels_{nm}", f"pred_pixels_{nm}",
-        ]
-
+        metric_fields += [f"iou_{nm}", f"dice_macro_{nm}", f"dice_micro_{nm}", f"gt_pixels_{nm}", f"pred_pixels_{nm}"]
     for c in TER_CLASSES:
         nm = TER_CLASS_NAMES[c]
-        metric_fields += [
-            f"ter_iou_{nm}",
-            f"ter_dice_macro_{nm}", f"ter_dice_micro_{nm}",
-            f"ter_gt_pixels_{nm}", f"ter_pred_pixels_{nm}",
-        ]
+        metric_fields += [f"ter_iou_{nm}", f"ter_dice_macro_{nm}", f"ter_dice_micro_{nm}", f"ter_gt_pixels_{nm}", f"ter_pred_pixels_{nm}"]
 
     history: dict[str, list] = {k: [] for k in metric_fields}
 
     best_selection = float("-inf") if SELECTION_MODE == "max" else float("inf")
     global_step = 0
+    last_row: dict[str, Any] | None = None
+    status = "running"
+    error_msg: str | None = None
+    error_tb: str | None = None
 
     try:
         for epoch in range(1, max_epochs + 1):
@@ -1133,7 +1293,6 @@ def main():
                 persistent_workers=persistent_workers,
                 worker_init_fn=seed_worker,
             )
-
             val_dl = DataLoader(
                 val_ds,
                 batch_size=batch_size,
@@ -1143,33 +1302,22 @@ def main():
                 persistent_workers=persistent_workers,
             )
 
-            # ---- Train ----
             model.train()
             sem_sum = 0.0
             ter_sum = 0.0
             tot_sum = 0.0
             n_seen = 0
 
-            for step, (x, sem, ter) in enumerate(train_dl, start=1):
+            for _, batch in enumerate(train_dl, start=1):
+                x, sem, ter = unpack_batch(batch)
                 x = x.to(device, non_blocking=True)
                 sem = sem.to(device, non_blocking=True)
                 ter = ter.to(device, non_blocking=True)
 
                 sem_logits, ter_logits = model(x)
 
-                sem_loss, _ = semantic_loss_dice_only(
-                    sem_logits,
-                    sem,
-                    dice_w=None,          # set to sem_w if you want weighted Dice
-                    ignore_index=None,
-                )
-
-                ter_loss = F.cross_entropy(
-                    ter_logits,
-                    ter,
-                    weight=None,
-                    reduction="mean",
-                )
+                sem_loss, _ = semantic_loss_dice_only(sem_logits, sem, dice_w=None, ignore_index=None)
+                ter_loss = F.cross_entropy(ter_logits, ter, weight=None, reduction="mean")
 
                 loss = sem_loss + float(TER_LOSS_WEIGHT) * ter_loss
 
@@ -1184,25 +1332,15 @@ def main():
                 n_seen += bs
                 global_step += 1
 
-                if (PREVIEW_EVERY_STEPS > 0) and (global_step % PREVIEW_EVERY_STEPS == 0):
-                    model.eval()
-                    with torch.no_grad():
-                        sem_logits_m, ter_logits_m = model(monitor_x)
-                    out_path = preview_dir / f"epoch{epoch:03d}_step{global_step:06d}.png"
-                    save_preview_panel_dual(out_path, monitor_x, monitor_sem, sem_logits_m, monitor_ter, ter_logits_m, b=0)
-                    print(f"[PREVIEW] {out_path}")
-                    model.train()
-
             train_loss_sem = sem_sum / max(1, n_seen)
             train_loss_ter = ter_sum / max(1, n_seen)
             train_loss_total = tot_sum / max(1, n_seen)
 
-            # ---- Eval ----
             val_metrics = evaluate(
                 model=model,
                 dl=val_dl,
                 device=device,
-                sem_dice_w=None,          # set to sem_w if you want weighted Dice in eval loss too
+                sem_dice_w=None,
                 ter_ce_w=None,
                 ter_loss_weight=TER_LOSS_WEIGHT,
                 ignore_index_sem=None,
@@ -1210,98 +1348,71 @@ def main():
                 dice_fg_only=False,
             )
 
-            monitor_value = float(val_metrics[MONITOR_KEY])
+            if MONITOR_KEY not in val_metrics:
+                raise KeyError(f"MONITOR_KEY '{MONITOR_KEY}' not found in val_metrics.")
+            if SELECTION_KEY not in val_metrics:
+                raise KeyError(f"SELECTION_KEY '{SELECTION_KEY}' not found in val_metrics.")
+
+            monitor_value = float(val_metrics[MONITOR_KEY]) if not np.isnan(float(val_metrics[MONITOR_KEY])) else float("inf")
             selection_value = float(val_metrics[SELECTION_KEY])
 
             prev_lr = opt.param_groups[0]["lr"]
             scheduler.step(monitor_value)
             lr_now = opt.param_groups[0]["lr"]
             if lr_now != prev_lr:
-                print(f"[LR] ReduceLROnPlateau: {prev_lr:.3e} -> {lr_now:.3e}")
+                print(f"[LR] {prev_lr:.3e} -> {lr_now:.3e}")
 
-            should_stop, stop_info = stopper.step(monitor_value, epoch)
+            if args.fixed_epochs and int(args.fixed_epochs) > 0:
+                should_stop = False
+            else:
+                should_stop, _ = stopper.step(monitor_value, epoch)
 
             row = {
                 "epoch": epoch,
                 "global_step": global_step,
-
                 "train_loss_sem": train_loss_sem,
                 "train_loss_ter": train_loss_ter,
                 "train_loss_total": train_loss_total,
-
                 "val_loss_sem": float(val_metrics["loss_sem"]),
                 "val_loss_ter": float(val_metrics["loss_ter"]),
                 "val_loss_total": float(val_metrics["loss_total"]),
-
                 "miou_all_macro": float(val_metrics["miou_all_macro"]),
                 "miou_all_micro": float(val_metrics["miou_all_micro"]),
-
                 "ter_miou_macro": float(val_metrics["ter_miou_macro"]),
                 "ter_miou_micro": float(val_metrics["ter_miou_micro"]),
-
                 "monitor_value": monitor_value,
                 "selection_value": selection_value,
-
-                "plateau_raw": stop_info["raw"],
-                "plateau_ema": stop_info["smoothed"],
-                "plateau_best": stop_info["best"],
-                "plateau_bad_epochs": stop_info["bad_epochs"],
-                "plateau_patience": stop_info["patience"],
                 "should_stop": int(should_stop),
                 "lr": lr_now,
+                "lambda_ter": float(TER_LOSS_WEIGHT),
+                "seed": int(args.seed),
             }
-
             for c in SEM_CLASSES:
                 nm = SEMANTIC_CLASS_NAMES[c]
-                row[f"iou_{nm}"] = float(val_metrics[f"iou_{nm}"])
+                row[f"iou_{nm}"] = float(val_metrics[f"iou_{nm}"]) if not np.isnan(float(val_metrics[f"iou_{nm}"])) else float("nan")
                 row[f"dice_macro_{nm}"] = float(val_metrics[f"dice_macro_{nm}"])
-                row[f"dice_micro_{nm}"] = float(val_metrics[f"dice_micro_{nm}"])
+                row[f"dice_micro_{nm}"] = float(val_metrics[f"dice_micro_{nm}"]) if not np.isnan(float(val_metrics[f"dice_micro_{nm}"])) else float("nan")
                 row[f"gt_pixels_{nm}"] = int(val_metrics[f"gt_pixels_{nm}"])
                 row[f"pred_pixels_{nm}"] = int(val_metrics[f"pred_pixels_{nm}"])
-
             for c in TER_CLASSES:
                 nm = TER_CLASS_NAMES[c]
-                row[f"ter_iou_{nm}"] = float(val_metrics[f"ter_iou_{nm}"])
+                row[f"ter_iou_{nm}"] = float(val_metrics[f"ter_iou_{nm}"]) if not np.isnan(float(val_metrics[f"ter_iou_{nm}"])) else float("nan")
                 row[f"ter_dice_macro_{nm}"] = float(val_metrics[f"ter_dice_macro_{nm}"])
-                row[f"ter_dice_micro_{nm}"] = float(val_metrics[f"ter_dice_micro_{nm}"])
+                row[f"ter_dice_micro_{nm}"] = float(val_metrics[f"ter_dice_micro_{nm}"]) if not np.isnan(float(val_metrics[f"ter_dice_micro_{nm}"])) else float("nan")
                 row[f"ter_gt_pixels_{nm}"] = int(val_metrics[f"ter_gt_pixels_{nm}"])
                 row[f"ter_pred_pixels_{nm}"] = int(val_metrics[f"ter_pred_pixels_{nm}"])
 
+            last_row = dict(row)
             append_metrics_row(metrics_csv, metric_fields, row)
             _history_append(history, row, metric_fields)
 
             print(f"\n===== EPOCH {epoch} SUMMARY =====")
-            print("\n-- TRAIN --")
-            print(f"train_loss_sem:   {train_loss_sem:.4f}")
-            print(f"train_loss_ter:   {train_loss_ter:.4f}")
-            print(f"train_loss_total: {train_loss_total:.4f}")
-
-            print("\n-- VAL (LOSS) --")
-            print(f"val_loss_sem:     {val_metrics['loss_sem']:.4f}")
-            print(f"val_loss_ter:     {val_metrics['loss_ter']:.4f}")
-            print(f"val_loss_total:   {val_metrics['loss_total']:.4f}")
-
-            print("\n-- VAL (SEMANTIC) --")
-            print(f"miou_all_macro:   {val_metrics['miou_all_macro']:.4f}")
-            print(f"miou_all_micro:   {val_metrics['miou_all_micro']:.4f}")
-            print("dice_macro:", _fmt_per_class(val_metrics["dice_macro_by_class"], SEMANTIC_CLASS_NAMES))
-            print("dice_micro:", _fmt_per_class(val_metrics["dice_micro_by_class"], SEMANTIC_CLASS_NAMES))
-
-            print("\n-- VAL (TERNARY) --")
-            print(f"ter_miou_macro:   {val_metrics['ter_miou_macro']:.4f}")
-            print(f"ter_miou_micro:   {val_metrics['ter_miou_micro']:.4f}")
-            print("ter_dice_macro:", _fmt_per_class(val_metrics["ter_dice_macro_by_class"], TER_CLASS_NAMES))
-            print("ter_dice_micro:", _fmt_per_class(val_metrics["ter_dice_micro_by_class"], TER_CLASS_NAMES))
-
-            print(
-                f"\n[MONITOR] {MONITOR_KEY}={monitor_value:.6f} (mode={MONITOR_MODE}) | "
-                f"[SELECT] {SELECTION_KEY}={selection_value:.6f} (mode={SELECTION_MODE})"
-            )
-            print(
-                f"[PLATEAU] raw={stop_info['raw']:.6f} ema={stop_info['smoothed']:.6f} "
-                f"best={stop_info['best']:.6f} bad_epochs={stop_info['bad_epochs']}/{stop_info['patience']} "
-                f"lr={lr_now:.3e}"
-            )
+            print(f"train_total={train_loss_total:.4f} (sem={train_loss_sem:.4f}, ter={train_loss_ter:.4f})")
+            print(f"val_total  ={val_metrics['loss_total']:.4f} (sem={val_metrics['loss_sem']:.4f}, ter={val_metrics['loss_ter']:.4f})")
+            print(f"SEM: miou_macro={val_metrics['miou_all_macro']:.4f} miou_micro={val_metrics['miou_all_micro']:.4f}")
+            print(f"TER: miou_macro={val_metrics['ter_miou_macro']:.4f} miou_micro={val_metrics['ter_miou_micro']:.4f}")
+            print(f"TER Dice macro: {_fmt_per_class(val_metrics['ter_dice_macro_by_class'], TER_CLASS_NAMES)}")
+            print(f"[MONITOR] {MONITOR_KEY}={monitor_value:.6f} | [SELECT] {SELECTION_KEY}={selection_value:.6f} | lr={lr_now:.3e}")
 
             improved = False
             if SELECTION_MODE == "max":
@@ -1318,30 +1429,13 @@ def main():
                     scheduler=scheduler,
                     epoch=epoch,
                     global_step=global_step,
-                    config={
-                        "run_name": run_name,
-                        "max_epochs": max_epochs,
-                        "batch_size": batch_size,
-                        "lr_init": lr,
-                        "monitor_key": MONITOR_KEY,
-                        "monitor_mode": MONITOR_MODE,
-                        "selection_key": SELECTION_KEY,
-                        "selection_mode": SELECTION_MODE,
-                        "ter_loss_weight": TER_LOSS_WEIGHT,
-                    },
+                    config=config,
                     extra_pt={"best_selection": float(best_selection)},
-                    extra_json={
-                        "best_selection": float(best_selection),
-                        "selection_key": SELECTION_KEY,
-                        "selection_mode": SELECTION_MODE,
-                        "monitor_key": MONITOR_KEY,
-                        "monitor_mode": MONITOR_MODE,
-                        "val_metrics": val_metrics,
-                    },
+                    extra_json={"best_selection": float(best_selection), "val_metrics": val_metrics},
                 )
                 update_alias(ckpt_dir / "LATEST__best.pt", ckpt_best_path)
                 update_alias(ckpt_dir / "LATEST__best.json", ckpt_best_path.with_suffix(".json"))
-                print(f"[CKPT] Saved BEST: {ckpt_best_path} (best_selection={best_selection:.6f})")
+                print(f"[CKPT] BEST saved (selection={best_selection:.6f})")
 
             save_checkpoint(
                 ckpt_last_path,
@@ -1350,39 +1444,207 @@ def main():
                 scheduler=scheduler,
                 epoch=epoch,
                 global_step=global_step,
-                config={
-                    "run_name": run_name,
-                    "max_epochs": max_epochs,
-                    "batch_size": batch_size,
-                    "lr_init": lr,
-                    "monitor_key": MONITOR_KEY,
-                    "monitor_mode": MONITOR_MODE,
-                    "selection_key": SELECTION_KEY,
-                    "selection_mode": SELECTION_MODE,
-                    "ter_loss_weight": TER_LOSS_WEIGHT,
-                },
+                config=config,
                 extra_pt={"best_selection": float(best_selection)},
-                extra_json={
-                    "best_selection": float(best_selection),
-                    "selection_key": SELECTION_KEY,
-                    "selection_mode": SELECTION_MODE,
-                    "monitor_key": MONITOR_KEY,
-                    "monitor_mode": MONITOR_MODE,
-                    "val_metrics": val_metrics,
-                },
+                extra_json={"best_selection": float(best_selection), "val_metrics": val_metrics},
             )
             update_alias(ckpt_dir / "LATEST__last.pt", ckpt_last_path)
 
-            if should_stop:
-                print(f"\n[STOP] Plateau detected on monitor ({MONITOR_KEY}) at epoch {epoch}.")
+            if args.fixed_epochs and int(args.fixed_epochs) > 0 and epoch >= int(args.fixed_epochs):
+                print(f"\n[STOP] Fixed-budget reached epoch {int(args.fixed_epochs)}.")
                 break
+            if should_stop:
+                print(f"\n[STOP] Plateau on {MONITOR_KEY} at epoch {epoch}.")
+                break
+
+        status = "ok"
+
+    except Exception as e:
+        status = "error"
+        error_msg = str(e)
+        error_tb = traceback.format_exc()
 
     finally:
         plots_dir = runs_dir / "plots"
         plots_dir.mkdir(parents=True, exist_ok=True)
         _plot_dashboard(plots_dir, history)
         write_json(plots_dir / "history.json", history)
-        print(f"[HISTORY] Wrote: {plots_dir / 'history.json'}")
+
+        run_result = {
+            "status": status,
+            "error": error_msg,
+            "traceback": error_tb,
+            "run_name": run_name,
+            "runs_dir": str(runs_dir),
+            "metrics_csv": str(metrics_csv),
+            "config_json": str(config_json),
+            "seed": int(args.seed),
+            "lambda_ter": float(TER_LOSS_WEIGHT),
+            "best_selection": safe_float(best_selection),
+            "selection_key": str(SELECTION_KEY),
+            "selection_mode": str(SELECTION_MODE),
+            "monitor_key": str(MONITOR_KEY),
+            "monitor_mode": str(MONITOR_MODE),
+            "ckpt_best_path": str(ckpt_best_path),
+            "ckpt_last_path": str(ckpt_last_path),
+            "last_epoch": int(last_row["epoch"]) if last_row else None,
+            "last_monitor_value": safe_float(last_row.get("monitor_value")) if last_row else None,
+            "last_selection_value": safe_float(last_row.get("selection_value")) if last_row else None,
+            "last_val_loss_total": safe_float(last_row.get("val_loss_total")) if last_row else None,
+            "last_ter_dice_macro_boundary": safe_float(last_row.get("ter_dice_macro_boundary")) if last_row else None,
+            "resolved_base_dir": str(base_dir),
+            "preflight": {"train": train_pf, "val": val_pf},
+        }
+        write_json(runs_dir / "run_result.json", run_result)
+
+        # concise end-of-run print
+        print("\n" + "=" * 110)
+        print(f"[RUN COMPLETE] status={status} run={run_name}")
+        if status != "ok":
+            print(f"[ERROR] {error_msg}")
+        else:
+            print(f"[BEST] selection={best_selection:.6f} key={SELECTION_KEY}")
+            if last_row:
+                print(f"[LAST] epoch={last_row['epoch']} val_loss_total={last_row['val_loss_total']:.4f} ter_boundary={last_row.get('ter_dice_macro_boundary')}")
+        print(f"[ARTIFACTS] {runs_dir}")
+        print("=" * 110 + "\n")
+
+    return run_result
+
+
+# -----------------------------
+# Grid runner
+# -----------------------------
+def run_grid(args: argparse.Namespace) -> int:
+    seeds = _parse_csv_ints(args.grid_seeds) if args.grid_seeds else []
+    lams = _parse_csv_floats(args.grid_lambdas) if args.grid_lambdas else []
+
+    if not seeds:
+        seeds = [int(args.seed)]
+    if not lams:
+        lams = [float(args.lambda_ter)]
+
+    stop_on_fail = bool(args.grid_stop_on_fail)
+    if args.grid_continue_on_fail:
+        stop_on_fail = False
+
+    total = len(seeds) * len(lams)
+    idx = 0
+    failures: list[dict[str, Any]] = []
+    grid_results: list[dict[str, Any]] = []
+    grid_started_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"\n[GRID] {len(seeds)} seeds x {len(lams)} lambdas = {total} runs")
+    print(f"[GRID] seeds={seeds}")
+    print(f"[GRID] lambdas={lams}")
+    print(f"[GRID] stop_on_fail={stop_on_fail}\n")
+
+    aborted = False
+
+    for seed in seeds:
+        if aborted:
+            break
+        for lam in lams:
+            idx += 1
+            print("=" * 110)
+            print(f"[GRID] RUN {idx}/{total} seed={seed} lambda_ter={lam}")
+            print("=" * 110)
+
+            child = argparse.Namespace(**vars(args))
+            child.grid = False
+            child.seed = int(seed)
+            child.lambda_ter = float(lam)
+
+            try:
+                run_result = run_single(child)
+                grid_results.append(run_result)
+
+                if run_result.get("status") != "ok":
+                    failures.append(
+                        {
+                            "seed": seed,
+                            "lambda_ter": lam,
+                            "error": run_result.get("error"),
+                            "run_name": run_result.get("run_name"),
+                            "runs_dir": run_result.get("runs_dir"),
+                        }
+                    )
+                    print(f"[GRID] FAIL seed={seed} lambda_ter={lam} error={run_result.get('error')}")
+                    if stop_on_fail:
+                        print("[GRID] stopping due to --grid_stop_on_fail")
+                        aborted = True
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                failures.append({"seed": seed, "lambda_ter": lam, "error": str(e), "traceback": tb})
+                print(f"[GRID] EXCEPTION seed={seed} lambda_ter={lam}: {e}")
+                if stop_on_fail:
+                    print("[GRID] stopping due to --grid_stop_on_fail")
+                    aborted = True
+
+            finally:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if aborted:
+                break
+
+    out_root = Path(env_str("OUT_ROOT", str(REPO_ROOT / "outputs")))
+    out_root = out_root if out_root.is_absolute() else (REPO_ROOT / out_root)
+    out_root = out_root.resolve()
+
+    grid_summary = {
+        "grid_started_at": grid_started_at,
+        "grid_finished_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "aborted_early": bool(aborted),
+        "run_prefix": str(args.run_prefix),
+        "encoder": str(args.encoder),
+        "encoder_weights": str(args.encoder_weights),
+        "fixed_epochs": int(args.fixed_epochs),
+        "batch_size": int(args.batch_size),
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "monitor_key": str(args.monitor_key),
+        "monitor_mode": str(args.monitor_mode),
+        "selection_key": str(args.selection_key),
+        "selection_mode": str(args.selection_mode),
+        "seeds": seeds,
+        "lambdas": lams,
+        "total_runs_planned": int(total),
+        "total_runs_executed": int(len(grid_results)),
+        "failures": failures,
+        "results": grid_results,
+    }
+
+    summary_path = out_root / "grid_summary.json"
+    write_json(summary_path, grid_summary)
+
+    print("\n" + "=" * 110)
+    print("[GRID] COMPLETE")
+    if failures:
+        print(f"[GRID] failures={len(failures)}/{total}")
+        for f in failures:
+            print(f"  - seed={f.get('seed')} lambda_ter={f.get('lambda_ter')} error={f.get('error')}")
+        print(f"[GRID_SUMMARY] {summary_path}")
+        print("=" * 110 + "\n")
+        return 1
+
+    print("[GRID] all runs succeeded")
+    print(f"[GRID_SUMMARY] {summary_path}")
+    print("=" * 110 + "\n")
+    return 0
+
+
+def main():
+    args = parse_args()
+    if args.grid:
+        rc = run_grid(args)
+        raise SystemExit(rc)
+    else:
+        run_result = run_single(args)
+        raise SystemExit(0 if run_result.get("status") == "ok" else 1)
 
 
 if __name__ == "__main__":
