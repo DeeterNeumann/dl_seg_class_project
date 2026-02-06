@@ -41,6 +41,16 @@ import random
 
 from PIL import Image
 
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+
+# ImageNet normalization constants (for pretrained ResNet encoder)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+IMAGENET_MEAN_NP = np.array(IMAGENET_MEAN)
+IMAGENET_STD_NP  = np.array(IMAGENET_STD)
+
 
 # -----------------------------
 # Project root + robust paths
@@ -629,6 +639,8 @@ def save_preview_panel_dual(
 
     img = x[b].detach().cpu().numpy()
     img = np.transpose(img, (1, 2, 0))
+    # Undo ImageNet normalization for display
+    img = img * IMAGENET_STD_NP + IMAGENET_MEAN_NP
     img = np.clip(img, 0, 1)
 
     sem_gt_np = sem_gt[b].detach().cpu().numpy()
@@ -796,6 +808,59 @@ class PlateauStopper:
 
 
 # -----------------------------
+# Augmentation wrapper (joint image + mask transforms)
+# -----------------------------
+class AugmentedDataset(torch.utils.data.Dataset):
+    """
+    Wraps ExportManifestDataset to apply joint albumentations to
+    image + sem_mask + ter_mask with identical spatial transforms.
+
+    The base dataset returns tensors; this wrapper converts back to numpy
+    for albumentations, then re-converts to tensors.
+    """
+    def __init__(self, base_dataset, transform=None):
+        self.base = base_dataset
+        self.transform = transform
+        # Forward DataFrame access for sampler weight computation
+        self.df = base_dataset.df
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        result = self.base[idx]
+        # base returns (x, sem, ter, meta) when return_meta=True
+        # or (x, sem, ter) when return_meta=False
+        if len(result) == 4:
+            x, sem, ter, meta = result
+        else:
+            x, sem, ter = result
+            meta = None
+
+        if self.transform is not None:
+            # Convert tensors to numpy for albumentations
+            # x is [3, H, W] float32 [0,1] -> [H, W, 3] uint8 [0,255]
+            img_np = (x.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+            sem_np = sem.numpy().astype(np.int32)
+            ter_np = ter.numpy().astype(np.int32)
+
+            augmented = self.transform(
+                image=img_np,
+                masks=[sem_np, ter_np],
+            )
+
+            # ToTensorV2 converts image to [3,H,W] float32 tensor
+            x = augmented["image"]
+            # Masks stay numpy from albumentations — convert back to long tensors
+            sem = torch.from_numpy(augmented["masks"][0]).long()
+            ter = torch.from_numpy(augmented["masks"][1]).long()
+
+        if meta is not None:
+            return x, sem, ter, meta
+        return x, sem, ter
+
+
+# -----------------------------
 # Model: shared encoder+decoder, two heads
 # -----------------------------
 class SharedUnetTwoHead(nn.Module):
@@ -833,6 +898,9 @@ class SharedUnetTwoHead(nn.Module):
 
         dec_out_ch = self.decoder_channels[-1]
 
+        # Spatial dropout on shared decoder features (regularization)
+        self.drop = nn.Dropout2d(p=0.2)
+
         self.sem_head = SegmentationHead(
             in_channels=dec_out_ch,
             out_channels=sem_classes,
@@ -852,6 +920,7 @@ class SharedUnetTwoHead(nn.Module):
             dec = self.base.decoder(*feats)
         except TypeError:
             dec = self.base.decoder(feats)
+        dec = self.drop(dec)  # spatial dropout before heads
         sem = self.sem_head(dec)
         ter = self.ter_head(dec)
         return sem, ter
@@ -1042,11 +1111,11 @@ def main():
     batch_size = 8
     lr = 1e-4
     max_epochs = 200
-    weight_decay = 1e-4
+    weight_decay = 3e-4              # Run 4 best (was 1e-4)
 
     # ---- NEW: freeze semantic head + focus loss on ternary ----
     FREEZE_SEMANTIC_HEAD = False
-    SEM_LOSS_WEIGHT = 0.7            # 0.0 = do not optimize semantic loss (recommended for this experiment)
+    SEM_LOSS_WEIGHT = 0.3            # Run 4 best (was 0.7)
     TER_LOSS_WEIGHT = 1.0            # keep aligned with best run (lambda_ter=2.0) unless you override here
 
     # ---- NEW: extra boundary upweighting (in addition to inverse-frequency weights) ----
@@ -1145,11 +1214,44 @@ def main():
     pin_memory = (device.type == "cuda")
     persistent_workers = (num_workers > 0)
 
-    # Data
+    # Data (raw datasets — no augmentation yet)
     train_data_config = ExportManifestConfig(csv_path=train_manifest_path, base_dir=base_dir)
     val_data_config   = ExportManifestConfig(csv_path=val_manifest_path,   base_dir=base_dir)
-    train_ds = ExportManifestDataset(train_data_config)
-    val_ds = ExportManifestDataset(val_data_config)
+    train_ds_raw = ExportManifestDataset(train_data_config)
+    val_ds_raw   = ExportManifestDataset(val_data_config)
+
+    # ---- Joint augmentation pipelines (albumentations) ----
+    # Train: geometric + color + mild affine + ImageNet normalize
+    train_aug = A.Compose([
+        # Geometric (free for histology — no orientation bias)
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        # Color (image-only; does not affect masks)
+        A.ColorJitter(
+            brightness=0.15, contrast=0.15,
+            saturation=0.1, hue=0.04, p=0.5,
+        ),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        # Mild affine (conservative to preserve thin 3px boundaries)
+        A.ShiftScaleRotate(
+            shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
+            border_mode=0, value=0, mask_value=0, p=0.3,  # border_mode=BORDER_CONSTANT
+        ),
+        # ImageNet normalization + tensor conversion
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+    # Validation: normalize only, no augmentation
+    val_aug = A.Compose([
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+    # Wrap with augmentation
+    train_ds = AugmentedDataset(train_ds_raw, transform=train_aug)
+    val_ds   = AugmentedDataset(val_ds_raw,   transform=val_aug)
 
     # Semantic weights (unused for optimization when SEM_LOSS_WEIGHT=0.0, but kept for completeness)
     sem_w = torch.tensor(wobj["weights"], dtype=torch.float32, device=device).clone()
@@ -1304,6 +1406,10 @@ def main():
         "ternary_encoding": {"0": "background", "1": "inside", "2": "boundary(inner)"},
         "ternary_ce_weights": ter_ce_w.detach().cpu().numpy().tolist(),
         "ternary_pixel_counts": ter_counts.tolist(),
+        "dropout_p": 0.2,
+        "augmentation": True,
+        "imagenet_normalize": True,
+        "augmentation_details": "HFlip+VFlip+Rot90+ColorJitter+GaussBlur+ShiftScaleRotate+ImageNetNorm",
     }
     config_json.write_text(json.dumps(config, indent=2))
 
