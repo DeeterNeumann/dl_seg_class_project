@@ -471,6 +471,56 @@ def semantic_loss_dice_only(
     return loss_dice, loss_dice
 
 
+def focal_cross_entropy(
+    logits: torch.Tensor,          # [B, C, H, W]
+    target: torch.Tensor,          # [B, H, W]  (class indices)
+    weight: torch.Tensor | None = None,  # [C] per-class alpha weights
+    gamma: float = 2.0,
+    reduction: str = "mean",
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Drop-in replacement for F.cross_entropy with an extra `gamma` parameter.
+    When gamma=0 this is numerically identical to F.cross_entropy.
+    """
+    # standard CE per pixel (unreduced)
+    ce = F.cross_entropy(
+        logits, target,
+        weight=weight,
+        reduction="none",
+        ignore_index=ignore_index,
+    )  # [B, H, W]
+
+    if gamma > 0:
+        # p_t = probability of the true class
+        log_p = F.log_softmax(logits, dim=1)                      # [B, C, H, W]
+        p_t = torch.gather(
+            log_p, dim=1,
+            index=target.unsqueeze(1).clamp(min=0),               # clamp for ignore_index safety
+        ).squeeze(1).exp()                                         # [B, H, W]
+
+        # focal modulator: (1 - p_t)^gamma
+        focal_weight = (1.0 - p_t).pow(gamma)
+
+        # zero out ignored positions so they don't contribute
+        if ignore_index >= 0:
+            valid = (target != ignore_index)
+            focal_weight = focal_weight * valid.float()
+
+        ce = focal_weight * ce
+
+    if reduction == "mean":
+        if ignore_index >= 0:
+            valid = (target != ignore_index)
+            return ce.sum() / valid.sum().clamp(min=1)
+        return ce.mean()
+    elif reduction == "sum":
+        return ce.sum()
+    return ce
+
+
 # -----------------------------
 # Compute ternary CE weights from TRAIN masks
 # -----------------------------
@@ -788,6 +838,7 @@ def evaluate(
     ignore_index_sem: int | None = None,
     ignore_index_ter: int | None = None,
     dice_fg_only: bool = False,
+    focal_gamma: float = 0.0,
 ):
     model.eval()
     eps = 1e-6
@@ -838,10 +889,11 @@ def evaluate(
             ignore_index=ignore_index_sem,
         )
 
-        ter_loss = F.cross_entropy(
+        ter_loss = focal_cross_entropy(
             ter_logits,
             ter,
             weight=ter_ce_w,
+            gamma=focal_gamma,
             reduction="mean",
             ignore_index=ignore_index_ter if ignore_index_ter is not None else -100,
         )
@@ -967,6 +1019,9 @@ def main():
     TER_WEIGHT_CAP_MIN = 0.05
     TER_WEIGHT_CAP_MAX = 10.0
     TER_BOUNDARY_HARD_CAP = 2.0
+
+    # ---- Focal loss for ternary head ----
+    FOCAL_GAMMA = 2.0                # 0.0 = plain CE; 2.0 = standard focal loss
 
     MONITOR_KEY = "combo_inside_boundary"
     MONITOR_MODE = "max"
@@ -1196,6 +1251,7 @@ def main():
         "sem_loss_weight": float(SEM_LOSS_WEIGHT),
         "ter_loss_weight": float(TER_LOSS_WEIGHT),
         "ter_boundary_mult": float(TER_BOUNDARY_MULT),
+        "focal_gamma": float(FOCAL_GAMMA),
         "monitor_key": MONITOR_KEY,
         "monitor_mode": MONITOR_MODE,
         "selection_key": SELECTION_KEY,
@@ -1321,11 +1377,12 @@ def main():
                     ignore_index=None,
                 )
 
-                # ternary CE uses computed weights + boundary upweighting
-                ter_loss = F.cross_entropy(
+                # ternary focal loss (gamma=0 falls back to plain CE)
+                ter_loss = focal_cross_entropy(
                     ter_logits,
                     ter,
                     weight=ter_ce_w,
+                    gamma=FOCAL_GAMMA,
                     reduction="mean",
                 )
 
@@ -1366,6 +1423,7 @@ def main():
                 ignore_index_sem=None,
                 ignore_index_ter=None,
                 dice_fg_only=False,
+                focal_gamma=FOCAL_GAMMA,
             )
 
             # ----- derive combined monitor/select metric (no KeyError) -----
@@ -1502,6 +1560,7 @@ def main():
                         "ter_loss_weight": TER_LOSS_WEIGHT,
                         "freeze_semantic_head": FREEZE_SEMANTIC_HEAD,
                         "ter_boundary_mult": TER_BOUNDARY_MULT,
+                        "focal_gamma": FOCAL_GAMMA,
                         "ternary_ce_weights": ter_ce_w.detach().cpu().numpy().tolist(),
                     },
                     extra_pt={"best_selection": float(best_selection)},
@@ -1538,6 +1597,7 @@ def main():
                     "ter_loss_weight": TER_LOSS_WEIGHT,
                     "freeze_semantic_head": FREEZE_SEMANTIC_HEAD,
                     "ter_boundary_mult": TER_BOUNDARY_MULT,
+                    "focal_gamma": FOCAL_GAMMA,
                     "ternary_ce_weights": ter_ce_w.detach().cpu().numpy().tolist(),
                 },
                 extra_pt={"best_selection": float(best_selection)},
