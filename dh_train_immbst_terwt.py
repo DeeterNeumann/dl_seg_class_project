@@ -1110,8 +1110,8 @@ def main():
 
     # Hyperparams
     batch_size = 8
-    lr = 1e-4
-    max_epochs = 120
+    lr = 3e-4
+    max_epochs = 100
     weight_decay = 3e-4              # Run 4 best (was 1e-4)
 
     # ---- NEW: freeze semantic head + focus loss on ternary ----
@@ -1414,7 +1414,9 @@ def main():
         "dropout_p": 0.2,
         "augmentation": True,
         "imagenet_normalize": True,
-        "augmentation_details": "HFlip+VFlip+Rot90+ColorJitter+GaussBlur+ShiftScaleRotate+ImageNetNorm",
+        "augmentation_details": "HFlip+VFlip+Rot90+ColorJitter+GaussBlur+Affine+ImageNetNorm",
+        "warmup_epochs": 5,
+        "lr_schedule": "LinearWarmup(5)+CosineAnnealing(95)",
     }
     config_json.write_text(json.dumps(config, indent=2))
 
@@ -1427,10 +1429,22 @@ def main():
 
     opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    warmup_epochs = 5
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         opt,
-        T_max=max_epochs,
+        start_factor=1e-5 / lr,   # starts at 1e-5
+        end_factor=1.0,            # ramps to lr (3e-4)
+        total_iters=warmup_epochs,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt,
+        T_max=max_epochs - warmup_epochs,  # cosine over remaining epochs
         eta_min=1e-6,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        opt,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
     )
 
     stopper = PlateauStopper(
@@ -1591,7 +1605,7 @@ def main():
             scheduler.step()
             lr_now = opt.param_groups[0]["lr"]
             if abs(lr_now - prev_lr) > 1e-10:
-                print(f"[LR] CosineAnnealing: {prev_lr:.3e} -> {lr_now:.3e}")
+                print(f"[LR] WarmupCosine: {prev_lr:.3e} -> {lr_now:.3e}")
 
             should_stop, stop_info = stopper.step(monitor_value, epoch)
 
