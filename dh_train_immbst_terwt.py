@@ -1110,7 +1110,7 @@ def main():
     # Hyperparams
     batch_size = 8
     lr = 1e-4
-    max_epochs = 200
+    max_epochs = 120
     weight_decay = 3e-4              # Run 4 best (was 1e-4)
 
     # ---- NEW: freeze semantic head + focus loss on ternary ----
@@ -1134,7 +1134,7 @@ def main():
     SELECTION_KEY = "combo_inside_boundary"
     SELECTION_MODE = "max"
 
-    plateau_patience = 15
+    plateau_patience = 20
     plateau_min_delta = 5e-4
     plateau_min_epochs = 25
 
@@ -1422,13 +1422,10 @@ def main():
 
     opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt,
-        mode="min" if MONITOR_MODE == "min" else "max",
-        factor=0.5,
-        patience=10,
-        threshold=plateau_min_delta,
-        threshold_mode="abs",
+        T_max=max_epochs,
+        eta_min=1e-6,
     )
 
     stopper = PlateauStopper(
@@ -1586,10 +1583,10 @@ def main():
             selection_value = resolve_metric(SELECTION_KEY)
 
             prev_lr = opt.param_groups[0]["lr"]
-            scheduler.step(monitor_value)
+            scheduler.step()
             lr_now = opt.param_groups[0]["lr"]
-            if lr_now != prev_lr:
-                print(f"[LR] ReduceLROnPlateau: {prev_lr:.3e} -> {lr_now:.3e}")
+            if abs(lr_now - prev_lr) > 1e-10:
+                print(f"[LR] CosineAnnealing: {prev_lr:.3e} -> {lr_now:.3e}")
 
             should_stop, stop_info = stopper.step(monitor_value, epoch)
 
