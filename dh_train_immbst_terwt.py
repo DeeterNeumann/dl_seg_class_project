@@ -851,9 +851,10 @@ class AugmentedDataset(torch.utils.data.Dataset):
 
             # ToTensorV2 converts image to [3,H,W] float32 tensor
             x = augmented["image"]
-            # Masks stay numpy from albumentations — convert back to long tensors
-            sem = torch.from_numpy(augmented["masks"][0]).long()
-            ter = torch.from_numpy(augmented["masks"][1]).long()
+            # albumentations 2.x: ToTensorV2 may convert masks to tensors too
+            m0, m1 = augmented["masks"][0], augmented["masks"][1]
+            sem = m0.long() if isinstance(m0, torch.Tensor) else torch.from_numpy(m0).long()
+            ter = m1.long() if isinstance(m1, torch.Tensor) else torch.from_numpy(m1).long()
 
         if meta is not None:
             return x, sem, ter, meta
@@ -1234,9 +1235,13 @@ def main():
         ),
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
         # Mild affine (conservative to preserve thin 3px boundaries)
-        A.ShiftScaleRotate(
-            shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
-            border_mode=0, value=0, mask_value=0, p=0.3,  # border_mode=BORDER_CONSTANT
+        A.Affine(
+            translate_percent=0.05,
+            scale=(0.9, 1.1),
+            rotate=(-15, 15),
+            interpolation=1,        # cv2.INTER_LINEAR
+            mask_interpolation=0,   # cv2.INTER_NEAREST (critical for masks)
+            p=0.3,
         ),
         # ImageNet normalization + tensor conversion
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
