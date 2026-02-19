@@ -114,5 +114,30 @@ docker run -p 7860:7860 cell-seg
 - Stain normalization
 - Instance segmentation via watershed or HoVer-Net approach
 - Quantitative TIL scoring
-   
+
+# Repository Structure
+
+dl_seg_class_project/
+├── deploy/                     # Hugging Face Spaces app (Docker + Gradio UI)
+│   ├── app.py                  # Web interface for WSI inference
+│   ├── inference.py            # Tiled inference & overlay logic
+│   ├── model.py                # Model architecture & loading
+│   ├── requirements.txt        # Deployment dependencies
+│   └── weights/                # Model checkpoints (Git LFS)
+│
+├── scripts/                    # Data preparation & experiment utilities
+│   ├── export_manifest_dataset.py
+│   └── other pipeline helpers
+│
+├── assets/                     # Project assets (configs, metadata)
+│
+├── dh_train_immune_boost.py    # Primary training script (multi-head model)
+├── dh_train_immbst_terwt.py    # Training variant (boundary weighting ablation)
+├── summarize_runs.py           # Training metrics aggregation
+├── generate_summary_doc.py     # Automated results report generation
+├── download_from_lightning.sh  # Artifact retrieval from Lightning runs
+├── training_run_summary.pdf    # Capstone results summary
+│
+├── .gitignore
+└── README.md
    
