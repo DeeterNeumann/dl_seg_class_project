@@ -16,6 +16,17 @@ from inference import (
 )
 
 DEVICE = "cpu"
+
+WEIGHTS_DIR = Path(__file__).parent / "weights"
+WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+WEIGHTS_PATH = WEIGHTS_DIR / "run9__best.pt"
+WEIGHTS_URL = "https://huggingface.co/drneumann/monusac-run9-segmentation/resolve/main/run9__best.pt"
+
+if not WEIGHTS_PATH.exists():
+    print(f"Downloading weights to {WEIGHTS_PATH} ...")
+    urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_PATH)
+
 MODEL = load_model("weights/run9_best.pt", device=DEVICE).to(DEVICE).eval().float()
 
 EXAMPLES_DIR = Path(__file__).parent / "examples"
