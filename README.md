@@ -104,6 +104,12 @@ docker run -p 7860:7860 cell-seg
 # Training Dynamics
 ![Training Dashboard](assets/figures/dashboard.png)
 
+# Qualitative Results
+
+The model jointly predicts semantic nucleus class (5-class) and ternary structure (background / inside / boundary).
+
+![Semantic and Ternary Prediction Example](assets/figures/semantic_ternary_example.png)
+
 # Training Summary and Observations
 [Training run summary (PDF)](assets/reports/training_run_summary.pdf)
 
