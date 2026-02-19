@@ -99,6 +99,9 @@ docker run -p 7860:7860 cell-seg
 3) Semantic overlay shows cell types
 4) Ternary overlay shows nucleus boundaries
 
+# Training Summary
+[Training run summary (PDF)](assets/reports/training_run_summary.pdf)
+
 # Results & Observations
 - Boundary-aware segmentation improves nucleus separation
 - Performance generalizes to MoNuSAC with minor degradation
