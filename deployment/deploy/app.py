@@ -24,8 +24,13 @@ WEIGHTS_PATH = WEIGHTS_DIR / "run9__best.pt"
 WEIGHTS_URL = "https://huggingface.co/drneumann/monusac-run9-segmentation/resolve/main/run9__best.pt"
 
 if not WEIGHTS_PATH.exists():
-    print(f"Downloading weights to {WEIGHTS_PATH} ...")
-    urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_PATH)
+    try:
+        print(f"Downloading weights to {WEIGHTS_PATH} ...")
+        urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_PATH)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download model weights from {WEIGHTS_URL}\nError: {e}"
+        )
 
 MODEL = load_model(str(WEIGHTS_PATH), device=DEVICE).to(DEVICE).eval().float()
 
@@ -41,12 +46,15 @@ EXAMPLE_URLS = [
 ]
 
 def ensure_examples_present():
-    # If examples already exist (e.g., cached), don't redownload
     if any(EXAMPLES_DIR.glob("*.png")):
         return
+
     for url in EXAMPLE_URLS:
         out_path = EXAMPLES_DIR / url.split("/")[-1]
-        urllib.request.urlretrieve(url, out_path)
+        try:
+            urllib.request.urlretrieve(url, out_path)
+        except Exception as e:
+            print(f"[WARN] Failed to download example {url}: {e}")
 
 ensure_examples_present()
 
@@ -107,14 +115,6 @@ with gr.Blocks(title="MoNuSAC Nucleus Segmentation") as demo:
         with gr.Column(scale=1):
             input_image = gr.Image(type="pil", label="Upload H&E Image")
             alpha_slider = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Overlay Opacity")
-            gr.Markdown("### Try an example")
-            gr.Examples(
-                examples=EXAMPLES,
-                inputs=[input_image, alpha_slider],
-                outputs=[sem_output, ter_output],
-                fn=predict,
-                cache_examples=True,
-            )
             run_btn = gr.Button("Run Segmentation", variant="primary")
 
             gr.Markdown("## Prediction Key")
@@ -126,7 +126,20 @@ with gr.Blocks(title="MoNuSAC Nucleus Segmentation") as demo:
             sem_output = gr.Image(label="Semantic Segmentation (cell types)")
             ter_output = gr.Image(label="Ternary Map (inside / boundary / background)")
 
-    run_btn.click(fn=predict, inputs=[input_image, alpha_slider], outputs=[sem_output, ter_output])
+    gr.Markdown("### Try an example")
+    gr.Examples(
+                examples=EXAMPLES,
+                inputs=[input_image, alpha_slider],
+                outputs=[sem_output, ter_output],
+                fn=predict,
+                cache_examples=True,
+            )
+
+    run_btn.click(
+        fn=predict,
+        inputs=[input_image, alpha_slider],
+        outputs=[sem_output, ter_output],
+    )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
