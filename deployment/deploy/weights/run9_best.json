@@ -1,0 +1,103 @@
+{
+  "config": {
+    "batch_size": 8,
+    "focal_gamma": 2.0,
+    "freeze_semantic_head": false,
+    "lr_init": 0.0003,
+    "max_epochs": 100,
+    "monitor_key": "combo_inside_boundary",
+    "monitor_mode": "max",
+    "run_name": "FROZENSEM__BOUNDW__resnet34__terLam1.0__bmult1.0__select_combo_inside_boundary__20260207_115812",
+    "selection_key": "combo_inside_boundary",
+    "selection_mode": "max",
+    "sem_loss_weight": 0.3,
+    "ter_boundary_mult": 1.0,
+    "ter_dice_weight": 0.5,
+    "ter_loss_weight": 1.0,
+    "ternary_ce_weights": [
+      0.12117122858762741,
+      0.7667240500450134,
+      2.112104654312134
+    ]
+  },
+  "extra_json": {
+    "best_selection": 0.6833754555068232,
+    "monitor_key": "combo_inside_boundary",
+    "monitor_mode": "max",
+    "selection_key": "combo_inside_boundary",
+    "selection_mode": "max",
+    "val_metrics": {
+      "dice_macro_background": 0.9492671643242692,
+      "dice_macro_by_class": {
+        "0": 0.9492671643242692,
+        "1": 0.7311269288924946,
+        "2": 0.22877094475113124,
+        "3": 0.06625666675078004,
+        "4": 0.08647976082832823
+      },
+      "dice_macro_epithelial": 0.7311269288924946,
+      "dice_macro_lymphocyte": 0.22877094475113124,
+      "dice_macro_macrophage": 0.08647976082832823,
+      "dice_macro_neutrophil": 0.06625666675078004,
+      "dice_micro_background": 0.951029694441593,
+      "dice_micro_by_class": {
+        "0": 0.951029694441593,
+        "1": 0.7504492182043087,
+        "2": 0.4452174666546839,
+        "3": 0.8930591634225665,
+        "4": 0.7869638723083587
+      },
+      "dice_micro_epithelial": 0.7504492182043087,
+      "dice_micro_lymphocyte": 0.4452174666546839,
+      "dice_micro_macrophage": 0.7869638723083587,
+      "dice_micro_neutrophil": 0.8930591634225665,
+      "gt_pixels_background": 28118433,
+      "gt_pixels_epithelial": 3864854,
+      "gt_pixels_lymphocyte": 872538,
+      "gt_pixels_macrophage": 1323235,
+      "gt_pixels_neutrophil": 30732,
+      "iou_background": 0.9115676879882812,
+      "iou_epithelial": 0.6971451640129089,
+      "iou_lymphocyte": 0.6196760535240173,
+      "iou_macrophage": 0.2653134763240814,
+      "iou_neutrophil": 0.524740993976593,
+      "loss_sem": 0.5922266075894294,
+      "loss_ter": 0.673051866535026,
+      "loss_total": 1.265278476179788,
+      "miou_all_macro": 0.7622613726447826,
+      "miou_all_micro": 0.8496426343917847,
+      "pred_pixels_background": 28335934,
+      "pred_pixels_epithelial": 4257944,
+      "pred_pixels_lymphocyte": 1195432,
+      "pred_pixels_macrophage": 394547,
+      "pred_pixels_neutrophil": 25935,
+      "ter_dice_macro_bg": 0.9410442484147621,
+      "ter_dice_macro_boundary": 0.4421829743818803,
+      "ter_dice_macro_by_class": {
+        "0": 0.9410442484147621,
+        "1": 0.7847571856144703,
+        "2": 0.4421829743818803
+      },
+      "ter_dice_macro_inside": 0.7847571856144703,
+      "ter_dice_micro_bg": 0.9430348719611312,
+      "ter_dice_micro_boundary": 0.44974609396674414,
+      "ter_dice_micro_by_class": {
+        "0": 0.9430348719611312,
+        "1": 0.7835023247382857,
+        "2": 0.44974609396674414
+      },
+      "ter_dice_micro_inside": 0.7835023247382857,
+      "ter_gt_pixels_bg": 28118433,
+      "ter_gt_pixels_boundary": 1415577,
+      "ter_gt_pixels_inside": 4675782,
+      "ter_iou_bg": 0.8975768089294434,
+      "ter_iou_boundary": 0.3009544610977173,
+      "ter_iou_inside": 0.6039505004882812,
+      "ter_miou_macro": 0.6176127065187214,
+      "ter_miou_micro": 0.8061923384666443,
+      "ter_pred_pixels_bg": 27502914,
+      "ter_pred_pixels_boundary": 2644819,
+      "ter_pred_pixels_inside": 4062059
+    }
+  }
+}
