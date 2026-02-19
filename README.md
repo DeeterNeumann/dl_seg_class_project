@@ -78,7 +78,7 @@ Hugging Face Spaces provides:
 
 1) clone repo  
 `ngit clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
-`cd dl_seg_class_project/deploy`
+`cd dl_seg_class_project/deployment/deploy`
 
 2) Install dependencies  
 `pip install -r requirements.txt`
@@ -89,9 +89,11 @@ Hugging Face Spaces provides:
 Open: http://localhost:7860
 
 # Docker Deployment  
+```
 cd deploy  
 docker build -t cell-seg .  
 docker run -p 7860:7860 cell-seg
+```
 
 # Example Workflow
 1) Upload H&E image
@@ -99,13 +101,24 @@ docker run -p 7860:7860 cell-seg
 3) Semantic overlay shows cell types
 4) Ternary overlay shows nucleus boundaries
 
-# Training Summary
+# Training Dynamics
+![Training Dashboard](assets/figures/dashboard.png)
+
+# Training Summary and Observations
 [Training run summary (PDF)](assets/reports/training_run_summary.pdf)
 
-# Results & Observations
-- Boundary-aware segmentation improves nucleus separation
-- Performance generalizes to MoNuSAC with minor degradation
-- Whole slide tiling enables scalable inference
+# Results
+
+## Final Validation Performance (Best Checkpoint)
+
+| Task | Metric | Value |
+|------|--------|------:|
+| Semantic (5-class) | mIoU (macro) | 0.756 |
+| Semantic (5-class) | mIoU (micro) | 0.856 |
+| Ternary | Dice (inside, macro) | 0.673 |
+| Ternary | Dice (boundary, macro) | 0.608 |
+| Ternary | Combo (inside + boundary) | 0.682 |
+| Ternary | mIoU (micro) | 0.801 |
 
 # Limitations
 - Trained on MoNuSAC -> domain shift on other tissues
