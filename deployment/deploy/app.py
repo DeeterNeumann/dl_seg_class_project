@@ -27,7 +27,7 @@ if not WEIGHTS_PATH.exists():
     print(f"Downloading weights to {WEIGHTS_PATH} ...")
     urllib.request.urlretrieve(WEIGHTS_URL, WEIGHTS_PATH)
 
-MODEL = load_model("weights/run9_best.pt", device=DEVICE).to(DEVICE).eval().float()
+MODEL = load_model(str(WEIGHTS_PATH), device=DEVICE).to(DEVICE).eval().float()
 
 EXAMPLES_DIR = Path(__file__).parent / "examples"
 EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
