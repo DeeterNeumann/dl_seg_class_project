@@ -31,3 +31,12 @@ datasets/
 lightning_outputs/
 *.docx
 summarize_runs_local_backup.py
+
+# macOS
+.DS_Store
+
+# macOS
+.DS_Store
+
+# macOS
+.DS_Store
