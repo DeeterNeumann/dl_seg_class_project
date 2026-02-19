@@ -77,14 +77,14 @@ Hugging Face Spaces provides:
 # Running Locally
 
 1) clone repo
-git clone https://github.com/DeeterNeumann/dl_seg_class_project.git
-cd dl_seg_class_project/deploy
+`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git
+cd dl_seg_class_project/deploy`
 
 2) Install dependencies
-pip install -r requirements.txt
+`pip install -r requirements.txt`
 
 3) Run app
-python app.py
+`python app.py`
 
 Open: http://localhost:7860
 
@@ -117,7 +117,7 @@ docker run -p 7860:7860 cell-seg
 - Quantitative TIL scoring
 
 # Repository Structure
-
+```
 dl_seg_class_project/
 ├── deploy/                     # Hugging Face Spaces app (Docker + Gradio UI)
 │   ├── app.py                  # Web interface for WSI inference
