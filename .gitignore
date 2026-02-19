@@ -26,3 +26,8 @@ datasets/
 *.pkl
 *.npz
 *.npy
+
+# Local outputs / artifacts
+lightning_outputs/
+*.docx
+summarize_runs_local_backup.py
