@@ -89,6 +89,7 @@ python app.py
 Open: http://localhost:7860
 
 # Docker Deployment
+cd deploy
 docker build -t cell-seg .
 docker run -p 7860:7860 cell-seg
 
