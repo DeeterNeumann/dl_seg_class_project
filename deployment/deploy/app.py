@@ -2,6 +2,7 @@ import os
 import gradio as gr
 import numpy as np
 from pathlib import Path
+import urllib.request
 
 from model import load_model
 from inference import (
@@ -18,9 +19,28 @@ DEVICE = "cpu"
 MODEL = load_model("weights/run9_best.pt", device=DEVICE).to(DEVICE).eval().float()
 
 EXAMPLES_DIR = Path(__file__).parent / "examples"
+EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+
+EXAMPLE_URLS = [
+    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-55-7570-01Z-00-DX1_002.png",
+    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-A2-A0ES-01Z-00-DX1_001.png",
+    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-DW-7838-01Z-00-DX1_2.png",
+    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-G9-6356-01Z-00-DX1_3.png",
+    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-G9-6367-01Z-00-DX1_7.png",
+]
+
+def ensure_examples_present():
+    # If examples already exist (e.g., cached), don't redownload
+    if any(EXAMPLES_DIR.glob("*.png")):
+        return
+    for url in EXAMPLE_URLS:
+        out_path = EXAMPLES_DIR / url.split("/")[-1]
+        urllib.request.urlretrieve(url, out_path)
+
+ensure_examples_present()
+
 EXAMPLE_FILES = sorted(str(p) for p in EXAMPLES_DIR.glob("*.png"))
 EXAMPLES = [[p, 0.5] for p in EXAMPLE_FILES]
-
 
 def build_legend_html(title: str, class_names: dict[int, str], colors: dict[int, tuple[int, int, int] | None]) -> str:
     rows = []
