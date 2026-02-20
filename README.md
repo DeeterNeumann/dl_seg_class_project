@@ -1,5 +1,5 @@
 ---
-title: CellClassification
+title: MonusacBoundaryAwareSegmentation
 sdk: docker
 app_port: 7860
 ---
@@ -25,7 +25,7 @@ The system demonstrates a full translational pipeline:
 - Interactive deployment via Hugging Face Spaces
 
 # Live Demo:
-https://huggingface.co/spaces/drneumann/CellClassification
+https://huggingface.co/spaces/drneumann/Monusac-Boundary-Aware-Segmentation
 
 # Objectives
 - Segment nuclei in histopathology images
