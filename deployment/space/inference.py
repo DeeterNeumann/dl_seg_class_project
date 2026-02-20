@@ -65,8 +65,16 @@ def run_tiled_inference(model, img_np, device="cpu"):
         return gauss_2d.astype(np.float32)
     
     Hp, Wp = padded.shape[:2]
-    coords = [(y, x) for y in range(0, Hp - TILE_SIZE + 1, STRIDE)
-                        for x in range(0, Wp - TILE_SIZE + 1, STRIDE)]
+
+    ys = list(range(0, Hp - TILE_SIZE + 1, STRIDE))
+    if ys[-1] + TILE_SIZE < Hp:
+        ys.append(Hp - TILE_SIZE)
+
+    xs = list(range(0, Wp - TILE_SIZE + 1, STRIDE))
+    if xs[-1] + TILE_SIZE < Wp:
+        xs.append(Wp - TILE_SIZE)
+
+    coords = [(y, x) for y in ys for x in xs]
     
     sem_accum = np.zeros((5, Hp, Wp), dtype=np.float32)     # 5 semantic classes
     ter_accum = np.zeros((3, Hp, Wp), dtype=np.float32)     # 3 ternary classes
