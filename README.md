@@ -46,12 +46,40 @@ Why multi-head?
 Boundary prediction improves instance separation and segmentation accuracy.
 
 # Dataset
+
+**Source:** [MoNuSAC 2020 Challenge](https://monusac-2020.grand-challenge.org/)
+
 Training
 - MoNuSAC 2020 - multi-organ nuclei segmentation dataset
 - H&E stained histopathology
 - 40x magnification
+
 Evaluation / Demo
 - MoNuSAC test WSIs
+
+## Preprocessing
+
+After downloading, run the export script to generate 256x256 patches and manifest CSVs:
+
+```bash
+python training/scripts/export_manifest_dataset.py
+```
+
+This produces the following structure under your data directory:
+
+```
+MoNuSAC_outputs/export_patches/
+├── train_P256_S128_fg0.01/
+│   ├── export_manifest_immune_counts.csv
+│   ├── rgb/
+│   ├── sem_gt/
+│   └── ter_gt/
+└── val_P256_S128_fg0.01/
+    ├── export_manifest_immune_counts.csv
+    ├── rgb/
+    ├── sem_gt/
+    └── ter_gt/
+```
 
 # Pipeline
 1) Preprocessing
@@ -85,7 +113,7 @@ https://huggingface.co/drneumann/monusac-run9-segmentation
 
 The Gradio application downloads the checkpoint at runtime on first launch.
 
-# Running Locally
+# Running Inference Locally
 
 1) Clone repo  
 `git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
@@ -99,12 +127,32 @@ The Gradio application downloads the checkpoint at runtime on first launch.
 
 Open: http://localhost:7860
 
-# Docker Deployment  
+# Docker Inference Deployment  
 ```
 cd deployment/space
 docker build -t cell-seg .
 docker run -p 7860:7860 cell-seg
 ```
+
+# Training
+
+1) Install training dependencies
+```bash
+pip install torch segmentation-models-pytorch albumentations numpy matplotlib Pillow pandas
+```
+
+2) Set `DATA_ROOT` to the parent directory containing `MoNuSAC_outputs/` and run training
+```bash
+DATA_ROOT=/path/to/your/data python training/train.py
+```
+
+The script accepts these environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATA_ROOT` | Parent directory containing `MoNuSAC_outputs/` | Lightning studio path |
+| `OUT_ROOT` | Where to write checkpoints and logs | `training/outputs/` |
+| `NUM_WORKERS` | DataLoader worker count | `4` |
 
 # Example Workflow
 1) Upload H&E image
