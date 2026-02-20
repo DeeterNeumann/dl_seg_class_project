@@ -1,5 +1,5 @@
 """
-dh_train_immune_boost.py (drop-in)
+dh_train_immbst_terwt.py
 
 Shared SMP encoder + shared Unet decoder + 2 heads:
   - semantic head: 5 classes (MoNuSAC nucleus typing: 0..4)
@@ -12,12 +12,7 @@ This script:
   - saves a single dashboard.png at the end
   - uses immune-aware WeightedRandomSampler logic
   - computes ternary class weights from TRAIN ternary masks and uses them in CE loss
-  - **NEW** freeze semantic head weights; keep encoder/decoder trainable; upweight ternary boundary
-
-Lightning-ready updates:
-  - Robust PROJECT_ROOT anchoring so assets/scripts resolve regardless of CWD
-  - TRAIN_MANIFEST / VAL_MANIFEST / BASE_DIR / OUT_ROOT / NUM_WORKERS / DATA_ROOT via env vars
-  - Default OUT_ROOT="./outputs"
+  - freeze semantic head weights; keep encoder/decoder trainable; upweight ternary boundary
 """
 
 import json
@@ -52,12 +47,8 @@ IMAGENET_MEAN_NP = np.array(IMAGENET_MEAN)
 IMAGENET_STD_NP  = np.array(IMAGENET_STD)
 
 
-# -----------------------------
-# Project root + robust paths
-# -----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent  # script lives at repo root
 
-# Ensure local imports (scripts/...) work from anywhere
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -93,9 +84,7 @@ import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.base import SegmentationHead
 
 
-# -----------------------------
-# Globals / constants
-# -----------------------------
+# globals / constants
 BASE_SEED = 7
 
 SEMANTIC_CLASS_NAMES = {
@@ -114,7 +103,7 @@ TER_CLASS_NAMES = {
 }
 TER_CLASSES = (0, 1, 2)
 
-# Base for repo-relative asset resolution
+# base for repo-relative asset resolution
 _ASSET_BASE = PROJECT_ROOT
 
 SEM_WEIGHTS_JSON = resolve_path("assets/class_weights.json", base=_ASSET_BASE)
@@ -122,9 +111,7 @@ with open(SEM_WEIGHTS_JSON, "r", encoding="utf-8") as f:
     wobj = json.load(f)
 
 
-# -----------------------------
-# Device + seeds
-# -----------------------------
+# device + seeds
 def get_device(force: str | None = None) -> torch.device:
     if force is not None:
         return torch.device(force)
@@ -149,9 +136,7 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-# -----------------------------
 # JSON helpers
-# -----------------------------
 def to_jsonable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
@@ -196,9 +181,7 @@ def update_alias(alias_path: Path, target_path: Path):
         shutil.copy2(target_path, alias_path)
 
 
-# -----------------------------
-# Checkpoint (.pt + sidecar .json)
-# -----------------------------
+# checkpoint (.pt + sidecar .json)
 def save_checkpoint(
     ckpt_path: Path,
     model: torch.nn.Module,
@@ -231,10 +214,7 @@ def save_checkpoint(
 
     torch.save(ckpt, ckpt_path)
 
-
-# -----------------------------
-# Metrics helpers
-# -----------------------------
+# metrics helpers
 def _bin_stats(pred: torch.Tensor, gt: torch.Tensor):
     inter = (pred & gt).sum().float()
     ps = pred.sum().float()
@@ -426,9 +406,7 @@ def unpack_batch(batch):
     return x, sem, ter, extras
 
 
-# -----------------------------
-# Losses
-# -----------------------------
+# losses
 def multiclass_soft_dice_loss(
     logits: torch.Tensor,          # [B,C,H,W]
     target: torch.Tensor,          # [B,H,W]
@@ -564,9 +542,7 @@ def ternary_combined_loss(
     return total, loss_fce, loss_dice
 
 
-# -----------------------------
-# Compute ternary CE weights from TRAIN masks
-# -----------------------------
+# compute ternary CE weights from TRAIN masks
 def compute_ternary_ce_weights_from_manifest(df, base_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     """
     Reads ter_gt_path masks from the TRAIN manifest and returns:
@@ -600,9 +576,7 @@ def compute_ternary_ce_weights_from_manifest(df, base_dir: Path) -> tuple[np.nda
     return counts, w
 
 
-# -----------------------------
-# Logging + plotting
-# -----------------------------
+# logging + plotting
 def append_metrics_row(path: Path, fieldnames: list[str], row: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
@@ -761,9 +735,7 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
     print(f"[PLOT] {out_path}")
 
 
-# -----------------------------
-# Plateau stopper (monitor-based)
-# -----------------------------
+# plateau stopper (monitor-based)
 @dataclass
 class PlateauStopper:
     patience: int = 80
@@ -807,9 +779,7 @@ class PlateauStopper:
         return should_stop, info
 
 
-# -----------------------------
-# Augmentation wrapper (joint image + mask transforms)
-# -----------------------------
+# augmentation wrapper (joint image + mask transforms)
 class AugmentedDataset(torch.utils.data.Dataset):
     """
     Wraps ExportManifestDataset to apply joint albumentations to
@@ -861,9 +831,7 @@ class AugmentedDataset(torch.utils.data.Dataset):
         return x, sem, ter
 
 
-# -----------------------------
-# Model: shared encoder+decoder, two heads
-# -----------------------------
+# model: shared encoder+decoder, two heads
 class SharedUnetTwoHead(nn.Module):
     """
     Version-robust dual-head U-Net:
@@ -927,9 +895,7 @@ class SharedUnetTwoHead(nn.Module):
         return sem, ter
 
 
-# -----------------------------
-# Eval
-# -----------------------------
+# eval
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -1102,9 +1068,7 @@ def evaluate(
     return out
 
 
-# -----------------------------
-# Main
-# -----------------------------
+# main
 def main():
     seed_everything(BASE_SEED)
 
@@ -1144,9 +1108,7 @@ def main():
     ENCODER = "resnet34"
     ENCODER_WEIGHTS = "imagenet"
 
-    # -----------------------------
-    # Data
-    # -----------------------------
+    # data
     DATA_ROOT = Path(env_str("DATA_ROOT", "/teamspace/studios/this_studio/data/monusac_clean")).resolve()
 
     train_manifest_path = Path(env_str(
@@ -1171,9 +1133,7 @@ def main():
     print("[VAL_MANIFEST]", val_manifest_path)
     print("[BASE_DIR]", base_dir)
 
-    # -----------------------------
-    # Outputs
-    # -----------------------------
+    # outputs
     default_out = Path(env_str("OUT_ROOT", str(PROJECT_ROOT / "outputs")))
     out_root = default_out if default_out.is_absolute() else (PROJECT_ROOT / default_out)
     out_root = out_root.resolve()
@@ -1198,7 +1158,7 @@ def main():
     if metrics_csv.exists():
         metrics_csv.unlink()
 
-    # Device + determinism
+    # device + determinism
     device = get_device()
     print("device:", device)
     print("[PROJECT_ROOT]", PROJECT_ROOT)
@@ -1210,31 +1170,31 @@ def main():
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
-    # DataLoader performance knobs
+    # dataLoader performance knobs
     num_workers = int(env_str("NUM_WORKERS", "4"))
     pin_memory = (device.type == "cuda")
     persistent_workers = (num_workers > 0)
 
-    # Data (raw datasets — no augmentation yet)
+    # data (raw datasets — no augmentation yet)
     train_data_config = ExportManifestConfig(csv_path=train_manifest_path, base_dir=base_dir)
     val_data_config   = ExportManifestConfig(csv_path=val_manifest_path,   base_dir=base_dir)
     train_ds_raw = ExportManifestDataset(train_data_config)
     val_ds_raw   = ExportManifestDataset(val_data_config)
 
-    # ---- Joint augmentation pipelines (albumentations) ----
-    # Train: geometric + color + mild affine + ImageNet normalize
+    # joint augmentation pipelines (albumentations)
+    # train: geometric + color + mild affine + ImageNet normalize
     train_aug = A.Compose([
-        # Geometric (free for histology — no orientation bias)
+        # geometric
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        # Color (image-only; does not affect masks)
+        # color (image-only; does not affect masks)
         A.ColorJitter(
             brightness=0.15, contrast=0.15,
             saturation=0.1, hue=0.04, p=0.5,
         ),
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-        # Mild affine (conservative to preserve thin 3px boundaries)
+        # mild affine (conservative, preserve thin 3px boundaries)
         A.Affine(
             translate_percent=0.05,
             scale=(0.9, 1.1),
@@ -1248,42 +1208,41 @@ def main():
         ToTensorV2(),
     ])
 
-    # Validation: normalize only, no augmentation
+    # validation: normalize only, no augmentation
     val_aug = A.Compose([
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
     ])
 
-    # Wrap with augmentation
+    # wrap with augmentation
     train_ds = AugmentedDataset(train_ds_raw, transform=train_aug)
     val_ds   = AugmentedDataset(val_ds_raw,   transform=val_aug)
 
-    # Semantic weights (unused for optimization when SEM_LOSS_WEIGHT=0.0, but kept for completeness)
+    # semantic weights (unused for optimization when SEM_LOSS_WEIGHT=0.0)
     sem_w = torch.tensor(wobj["weights"], dtype=torch.float32, device=device).clone()
     sem_w[3] = min(sem_w[3].item(), 6.0)  # neutrophil cap
     sem_w[4] = min(sem_w[4].item(), 2.0)  # macrophage cap
     print("[sem weights (capped)]", sem_w.detach().cpu().numpy().tolist())
 
-    # -----------------------------
-    # Ternary CE weights from TRAIN ternary masks + boundary multiplier
-    # Compute raw inverse-frequency weights
+    # ternary CE weights from TRAIN ternary masks + boundary multiplier
+    # compute raw inverse-frequency weights
     ter_counts, ter_w_raw = compute_ternary_ce_weights_from_manifest(
         train_ds.df, base_dir=base_dir
     )
     ter_w_raw = ter_w_raw.astype(np.float64)
 
-    # ---- Stage 1: initial clip (safety) ----
+    # stage 1: initial clip (safety)
     ter_w_stage1 = np.clip(
         ter_w_raw,
         TER_WEIGHT_CAP_MIN,
         TER_WEIGHT_CAP_MAX,
     )
 
-    # ---- Stage 2: optional boundary upweight ----
+    # stage 2: optional boundary upweight
     ter_w_stage2 = ter_w_stage1.copy()
     ter_w_stage2[2] *= float(TER_BOUNDARY_MULT)
 
-    # ---- Stage 3: clip + hard cap (halo control) ----
+    # stage 3: clip + hard cap (halo control)
     ter_w_clip = np.clip(
         ter_w_stage2,
         TER_WEIGHT_CAP_MIN,
@@ -1291,18 +1250,18 @@ def main():
     )
     ter_w_clip[2] = min(ter_w_clip[2], float(TER_BOUNDARY_HARD_CAP))
 
-    # ---- Stage 4: renormalize (keep mean ≈ 1) ----
+    # stage 4: renormalize (keep mean ≈ 1)
     ter_w_final = ter_w_clip / ter_w_clip.mean()
 
     ter_ce_w = torch.tensor(ter_w_final, dtype=torch.float32, device=device)
 
-    # ---- Logging ----
+    # logging
     print("[ternary pixel counts bg/inside/boundary]", ter_counts.tolist())
     print("[ternary CE weights RAW]", ter_w_raw.tolist())
     print("[ternary CE weights CLIP]", ter_w_clip.tolist())
     print("[ternary CE weights FINAL]", ter_w_final.tolist())
 
-    # ---- immune-aware sampling (TRAIN ONLY) ----
+    # immune-aware sampling (TRAIN ONLY)
     req_cols = ["px_lymphocyte", "px_neutrophil", "px_macrophage"]
     missing = [c for c in req_cols if c not in train_ds.df.columns]
     if missing:
@@ -1341,7 +1300,7 @@ def main():
         replacement=True,
     )
 
-    # Probe val batch for sanity + preview monitor
+    # probe val batch for sanity + preview monitor
     val_probe_dl = DataLoader(
         val_ds,
         batch_size=batch_size,
@@ -1360,7 +1319,7 @@ def main():
     monitor_sem = sem0.to(device)
     monitor_ter = ter0.to(device)
 
-    # Model (dual-head)
+    # model (dual-head)
     model = SharedUnetTwoHead(
         encoder_name=ENCODER,
         encoder_weights=ENCODER_WEIGHTS,
@@ -1371,15 +1330,13 @@ def main():
         activation=None,
     ).to(device)
 
-    # -----------------------------
-    # NEW: freeze semantic head weights (keep encoder+decoder trainable)
-    # -----------------------------
+    # freeze semantic head weights (keep encoder+decoder trainable)
     if FREEZE_SEMANTIC_HEAD:
         for p in model.sem_head.parameters():
             p.requires_grad = False
         print("[FREEZE] semantic head frozen (requires_grad=False)")
 
-    # Config logging
+    # config logging
     config = {
         "run_name": run_name,
         "seed": int(BASE_SEED),
@@ -1420,9 +1377,7 @@ def main():
     }
     config_json.write_text(json.dumps(config, indent=2))
 
-    # -----------------------------
-    # Optimizer: exclude frozen semantic head params
-    # -----------------------------
+    # optimizer: exclude frozen semantic head params (if frozen)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters found (did you freeze too much?).")
@@ -1455,7 +1410,7 @@ def main():
         ema_alpha=0.3,
     )
 
-    # Metrics schema
+    # metrics schema
     metric_fields = [
         "epoch", "global_step",
         "train_loss_sem", "train_loss_ter", "train_loss_total",
@@ -1513,7 +1468,7 @@ def main():
                 persistent_workers=persistent_workers,
             )
 
-            # ---- Train ----
+            # train
             model.train()
             sem_sum = 0.0
             ter_sum = 0.0
@@ -1532,11 +1487,11 @@ def main():
                 sem_loss, _ = semantic_loss_dice_only(
                     sem_logits,
                     sem,
-                    dice_w=None,  # set to sem_w if you want weighted Dice
+                    dice_w=None,  # set to sem_w if want weighted Dice
                     ignore_index=None,
                 )
 
-                # ternary combined loss: focal CE + Dice
+                # ternary combined loss: focal CE + dice
                 ter_loss, _ter_fce, _ter_dice = ternary_combined_loss(
                     ter_logits,
                     ter,
@@ -1572,7 +1527,7 @@ def main():
             train_loss_ter = ter_sum / max(1, n_seen)
             train_loss_total = tot_sum / max(1, n_seen)
 
-            # ---- Eval ----
+            # eval
             val_metrics = evaluate(
                 model=model,
                 dl=val_dl,
@@ -1587,7 +1542,7 @@ def main():
                 ter_dice_weight=TER_DICE_WEIGHT,
             )
 
-            # ----- derive combined monitor/select metric (no KeyError) -----
+            # derive combined monitor/select metric
             combo_inside_boundary = (
                 0.7 * float(val_metrics["ter_dice_micro_inside"])
                 + 0.3 * float(val_metrics["ter_dice_micro_boundary"])
