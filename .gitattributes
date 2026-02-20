@@ -1,0 +1,3 @@
+*.png filter=xet diff=xet merge=xet -text
+*.pdf filter=xet diff=xet merge=xet -text
+*.pt filter=xet diff=xet merge=xet -text
