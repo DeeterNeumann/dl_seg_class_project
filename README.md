@@ -88,7 +88,7 @@ The Gradio application downloads the checkpoint at runtime on first launch.
 
 1) clone repo  
 `git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
-`cd dl_seg_class_project/deployment/deploy`
+`cd dl_seg_class_project/deployment/space`
 
 2) Install dependencies  
 `pip install -r requirements.txt`
