@@ -38,11 +38,11 @@ EXAMPLES_DIR = Path(__file__).parent / "examples"
 EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
 
 EXAMPLE_URLS = [
-    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-55-7570-01Z-00-DX1_002.png",
-    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-A2-A0ES-01Z-00-DX1_001.png",
-    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-DW-7838-01Z-00-DX1_2.png",
-    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-G9-6356-01Z-00-DX1_3.png",
-    "https://raw.githubusercontent.com/DeeterNeumann/dl_seg_class_project/main/assets/examples/TCGA-G9-6367-01Z-00-DX1_7.png",
+    "https://huggingface.co/spaces/drneumann/CellClassification/resolve/main/assets/examples/TCGA-55-7570-01Z-00-DX1_002.png",
+    "https://huggingface.co/spaces/drneumann/CellClassification/resolve/main/assets/examples/TCGA-A2-A0ES-01Z-00-DX1_001.png",
+    "https://huggingface.co/spaces/drneumann/CellClassification/resolve/main/assets/examples/TCGA-DW-7838-01Z-00-DX1_2.png",
+    "https://huggingface.co/spaces/drneumann/CellClassification/resolve/main/assets/examples/TCGA-G9-6356-01Z-00-DX1_3.png",
+    "https://huggingface.co/spaces/drneumann/CellClassification/resolve/main/assets/examples/TCGA-G9-6367-01Z-00-DX1_7.png",
 ]
 
 def ensure_examples_present():
