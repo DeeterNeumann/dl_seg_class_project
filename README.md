@@ -1,3 +1,9 @@
+---
+title: CellClassification
+sdk: docker
+app_port: 7860
+---
+
 # MoNuSAC Nucleus Segmentation and Classification
 
 [![Hugging Face Space](https://img.shields.io/badge/Live-Demo-orange?logo=huggingface)](https://huggingface.co/spaces/drneumann/CellClassification)
@@ -127,9 +133,8 @@ The Gradio application downloads the checkpoint at runtime on first launch.
 
 Open: http://localhost:7860
 
-# Docker Inference Deployment  
+# Docker Inference Deployment
 ```
-cd deployment/space
 docker build -t cell-seg .
 docker run -p 7860:7860 cell-seg
 ```
@@ -201,6 +206,8 @@ The model jointly predicts semantic nucleus class (5-class) and ternary structur
 ```
 dl_seg_class_project/
 ├── README.md                         # Project overview and documentation
+├── Dockerfile                        # HF Space container configuration (root)
+├── requirements.txt                  # Space dependencies (root)
 │
 ├── training/                         # Model training pipeline
 │   ├── train.py                      # Main training loop + evaluation + CLI
@@ -214,8 +221,6 @@ dl_seg_class_project/
 │       ├── app.py                    # Gradio UI + runtime weight download
 │       ├── model.py                  # Model architecture + load_model()
 │       ├── inference.py              # Tiled inference + overlay utilities
-│       ├── requirements.txt          # Space dependencies
-│       ├── Dockerfile                # HF Space container configuration
 │       └── weights/                  # Runtime-downloaded model checkpoint
 │
 ├── assets/                           # Static project artifacts
