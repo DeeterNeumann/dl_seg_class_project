@@ -155,7 +155,6 @@ dl_seg_class_project/
 │
 ├── training/                         # Model training pipeline
 │   ├── dh_train_immbst_terwt.py      # Multi-head training (semantic + ternary)
-│   ├── dh_train_immune_boost.py      # Immune-aware training variant
 │   └── scripts/
 │       └── export_manifest_dataset.py  # Dataset manifest + preprocessing utilities
 │
