@@ -1,6 +1,7 @@
 # MoNuSAC Nucleus Segmentation and Classification
 
-![Hugging Face Space](https://img.shields.io/badge/🤗%20Space-Live-blue)
+[![Hugging Face Space](https://img.shields.io/badge/Live-Demo-orange?logo=huggingface)](https://huggingface.co/spaces/drneumann/CellClassification)
+[![Model Weights](https://img.shields.io/badge/HF-Model-blue)](https://huggingface.co/drneumann/monusac-run9-segmentation)
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
