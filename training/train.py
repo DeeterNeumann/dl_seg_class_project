@@ -239,20 +239,20 @@ def main():
     batch_size = 8
     lr = 3e-4
     max_epochs = 100
-    weight_decay = 3e-4              # Run 4 best (was 1e-4)
+    weight_decay = 3e-4              
 
-    # ---- NEW: freeze semantic head + focus loss on ternary ----
+    # ---- freeze semantic head + focus loss on ternary ----
     FREEZE_SEMANTIC_HEAD = False
-    SEM_LOSS_WEIGHT = 0.3            # Run 4 best (was 0.7)
-    TER_LOSS_WEIGHT = 1.0            # keep aligned with best run (lambda_ter=2.0) unless you override here
+    SEM_LOSS_WEIGHT = 0.3            
+    TER_LOSS_WEIGHT = 1.0            
 
-    # ---- NEW: extra boundary upweighting (in addition to inverse-frequency weights) ----
+    # ---- extra boundary upweighting (in addition to inverse-frequency weights) ----
     TER_BOUNDARY_MULT = 1.0          # multiplies class-2 weight after frequency weighting
     TER_WEIGHT_CAP_MIN = 0.05
     TER_WEIGHT_CAP_MAX = 10.0
     TER_BOUNDARY_HARD_CAP = 2.0
 
-    # ---- Focal loss for ternary head ----
+    # ---- focal loss for ternary head ----
     FOCAL_GAMMA = 2.0                # 0.0 = plain CE; 2.0 = standard focal loss
     TER_DICE_WEIGHT = 0.5            # lambda for Dice in combined ternary loss: focalCE + TER_DICE_WEIGHT * Dice
 
