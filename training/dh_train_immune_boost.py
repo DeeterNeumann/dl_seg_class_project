@@ -12,22 +12,6 @@ This script:
   - writes metrics.csv + history.json
   - saves a single dashboard.png at the end
   - uses immune-aware WeightedRandomSampler logic
-
-Lightning-ready:
-  - Robust REPO_ROOT anchoring so assets/scripts resolve regardless of CWD
-  - DATA_ROOT / TRAIN_MANIFEST / VAL_MANIFEST / BASE_DIR / OUT_ROOT / NUM_WORKERS via env vars
-  - Default OUT_ROOT = "<repo>/outputs"
-
-NEW:
-  - Optional grid runner mode:
-      --grid
-      --grid_seeds 1337,2021,7
-      --grid_lambdas 0.25,0.5,1.0,2.0
-
-CRITICAL PATH FIXES:
-  - Auto-detect DATA_ROOT (prefers /team if present; falls back to /teamspace/...).
-  - Auto-resolve BASE_DIR by testing candidate roots against manifest paths.
-  - Hard preflight checks BEFORE spawning DataLoader workers (so you don't waste grid runs).
 """
 
 from __future__ import annotations
@@ -58,9 +42,7 @@ import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.base import SegmentationHead
 
 
-# -----------------------------
-# Repo root + robust imports
-# -----------------------------
+# repo root + robust imports
 THIS_FILE = Path(__file__).resolve()
 if THIS_FILE.parent.name == "scripts":
     REPO_ROOT = THIS_FILE.parent.parent
@@ -73,9 +55,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.export_manifest_dataset import ExportManifestDataset, ExportManifestConfig  # noqa: E402
 
 
-# -----------------------------
 # CLI args
-# -----------------------------
 def _parse_csv_ints(s: str) -> list[int]:
     s = (s or "").strip()
     if not s:
@@ -105,20 +85,20 @@ def _parse_csv_floats(s: str) -> list[float]:
 def parse_args():
     p = argparse.ArgumentParser()
 
-    # ---- Grid runner knobs ----
+    # grid runner knobs
     p.add_argument("--grid", action="store_true", help="Enable grid-runner (loops seeds x lambdas inside Python).")
     p.add_argument("--grid_seeds", type=str, default="", help="Comma-separated seeds, e.g. 1337,2021,7")
     p.add_argument("--grid_lambdas", type=str, default="", help="Comma-separated lambdas, e.g. 0.25,0.5,1.0,2.0")
     p.add_argument("--grid_stop_on_fail", action="store_true", help="Stop grid immediately if a run fails.")
     p.add_argument("--grid_continue_on_fail", action="store_true", help="Continue grid if a run fails (default).")
 
-    # Core experiment knobs
+    # core experiment knobs
     p.add_argument("--lambda_ter", type=float, default=1.0, help="Weight for ternary CE loss in total loss.")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--run_prefix", type=str, default="DUALHEAD")
     p.add_argument("--notes", type=str, default="")
 
-    # Fixed-budget mode for clean comparisons
+    # fixed-budget mode for clean comparisons
     p.add_argument(
         "--fixed_epochs",
         type=int,
@@ -126,24 +106,24 @@ def parse_args():
         help="If >0, train exactly this many epochs (disables early-stop).",
     )
 
-    # Common training knobs
+    # common training knobs
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--max_epochs", type=int, default=1200)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--preview_every_steps", type=int, default=200)
 
-    # Monitor/selection controls
+    # monitor/selection controls
     p.add_argument("--monitor_key", type=str, default="loss_total")
     p.add_argument("--monitor_mode", type=str, default="min", choices=["min", "max"])
     p.add_argument("--selection_key", type=str, default="ter_dice_macro_boundary")
     p.add_argument("--selection_mode", type=str, default="max", choices=["min", "max"])
 
-    # Optional: override encoder
+    # optional: override encoder
     p.add_argument("--encoder", type=str, default="resnet34")
     p.add_argument("--encoder_weights", type=str, default="imagenet")
 
-    # Debug/preflight knobs
+    # debug/preflight knobs
     p.add_argument("--preflight_rows", type=int, default=200, help="How many manifest rows to sample for path checks.")
     p.add_argument("--preflight_fail_fast", action="store_true", help="If any missing file in sampled rows => fail fast.")
 
@@ -167,9 +147,7 @@ def build_run_name(prefix: str, encoder: str, lam: float, seed: int) -> str:
     return f"{prefix}__{encoder}__lamTer{lam_s}__seed{seed}__{ts}"
 
 
-# -----------------------------
-# Env + path helpers
-# -----------------------------
+# env + path helpers
 def env_str(key: str, default: str) -> str:
     v = os.environ.get(key, "").strip()
     return v if v else default
@@ -353,9 +331,7 @@ def _preflight_manifest_paths(
     return best_base, best_details
 
 
-# -----------------------------
-# Globals / constants
-# -----------------------------
+# globals / constants
 SEMANTIC_CLASS_NAMES = {
     0: "background",
     1: "epithelial",
@@ -376,9 +352,7 @@ with open(SEM_WEIGHTS_JSON, "r", encoding="utf-8") as f:
     wobj = json.load(f)
 
 
-# -----------------------------
-# Device + seeds
-# -----------------------------
+# device + seeds
 def get_device(force: str | None = None) -> torch.device:
     if force is not None:
         return torch.device(force)
@@ -403,9 +377,7 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-# -----------------------------
 # JSON helpers
-# -----------------------------
 def to_jsonable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
@@ -459,9 +431,7 @@ def safe_float(x, default=None):
         return default
 
 
-# -----------------------------
-# Checkpoint (.pt + sidecar .json)
-# -----------------------------
+# checkpoint (.pt + sidecar .json)
 def save_checkpoint(
     ckpt_path: Path,
     model: torch.nn.Module,
@@ -495,9 +465,7 @@ def save_checkpoint(
     torch.save(ckpt, ckpt_path)
 
 
-# -----------------------------
-# Metrics helpers
-# -----------------------------
+# metrics helpers 
 def _bin_stats(pred: torch.Tensor, gt: torch.Tensor):
     inter = (pred & gt).sum().float()
     ps = pred.sum().float()
@@ -657,9 +625,7 @@ def ternary_iou_all(ter_logits: torch.Tensor, ter_gt: torch.Tensor, classes=TER_
     return miou_macro_per_img, miou_micro, iou_by_class_micro
 
 
-# -----------------------------
-# Losses
-# -----------------------------
+# losses
 def multiclass_soft_dice_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -712,9 +678,7 @@ def semantic_loss_dice_only(
     return loss_dice, loss_dice
 
 
-# -----------------------------
-# Logging + plotting
-# -----------------------------
+# logging + plotting
 def append_metrics_row(path: Path, fieldnames: list[str], row: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
@@ -826,9 +790,7 @@ def _plot_dashboard(plots_dir: Path, history: dict[str, list]):
     print(f"[PLOT] {out_path}")
 
 
-# -----------------------------
-# Plateau stopper
-# -----------------------------
+# plateau stopper
 @dataclass
 class PlateauStopper:
     patience: int = 80
@@ -861,9 +823,7 @@ class PlateauStopper:
         return should_stop, info
 
 
-# -----------------------------
-# Model: shared encoder+decoder, two heads
-# -----------------------------
+# model: shared encoder+decoder, two heads
 class SharedUnetTwoHead(nn.Module):
     def __init__(
         self,
@@ -900,9 +860,7 @@ class SharedUnetTwoHead(nn.Module):
         return sem, ter
 
 
-# -----------------------------
-# Eval
-# -----------------------------
+# eval
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -1053,9 +1011,7 @@ def evaluate(
     return out
 
 
-# -----------------------------
-# Single-run main logic
-# -----------------------------
+# single-run main logic
 def run_single(args: argparse.Namespace) -> dict[str, Any]:
     seed_everything(args.seed)
 
@@ -1075,7 +1031,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     ENCODER = str(args.encoder)
     ENCODER_WEIGHTS = str(args.encoder_weights) if args.encoder_weights else None
 
-    # ---- ROOTS & MANIFESTS (robust) ----
+    # roots and manifests
     data_root_default = _default_data_root()
     DATA_ROOT = Path(env_str("DATA_ROOT", str(data_root_default))).resolve()
 
@@ -1084,7 +1040,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     train_manifest_path = _resolve_manifest_path("TRAIN_MANIFEST", train_manifest_default)
     val_manifest_path = _resolve_manifest_path("VAL_MANIFEST", val_manifest_default)
 
-    # Base candidates include: BASE_DIR env if set, DATA_ROOT, parent of manifest, /team, /teamspace/... and REPO_ROOT
+    # base candidates include: BASE_DIR env if set, DATA_ROOT, parent of manifest, /team, /teamspace/... and REPO_ROOT
     base_candidates: list[Path] = []
     base_env = os.environ.get("BASE_DIR", "").strip()
     if base_env:
@@ -1093,7 +1049,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     base_candidates.extend(_candidate_data_roots())
     base_candidates.append(REPO_ROOT)
 
-    # De-dupe
+    # de-dupe
     seen = set()
     deduped: list[Path] = []
     for p in base_candidates:
@@ -1104,7 +1060,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         deduped.append(pr)
     base_candidates = deduped
 
-    # Preflight to find a working BASE_DIR that matches manifest paths
+    # preflight to find a working BASE_DIR that matches manifest paths
     base_dir_train, train_pf = _preflight_manifest_paths(
         train_manifest_path,
         base_candidates,
@@ -1118,7 +1074,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
         fail_fast=bool(args.preflight_fail_fast),
     )
 
-    # If they disagree, choose the better score (they should both be ~1.0 if correct)
+    # if they disagree, choose the better score (they should both be ~1.0 if correct)
     base_dir = base_dir_train
     if val_pf["score"] > train_pf["score"]:
         base_dir = base_dir_val
@@ -1168,7 +1124,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     train_ds = ExportManifestDataset(train_data_config)
     val_ds = ExportManifestDataset(val_data_config)
 
-    # ---- immune-aware sampler ----
+    # immune-aware sampler
     req_cols = ["px_lymphocyte", "px_neutrophil", "px_macrophage"]
     missing = [c for c in req_cols if c not in train_ds.df.columns]
     if missing:
@@ -1512,9 +1468,7 @@ def run_single(args: argparse.Namespace) -> dict[str, Any]:
     return run_result
 
 
-# -----------------------------
-# Grid runner
-# -----------------------------
+# grid runner
 def run_grid(args: argparse.Namespace) -> int:
     seeds = _parse_csv_ints(args.grid_seeds) if args.grid_seeds else []
     lams = _parse_csv_floats(args.grid_lambdas) if args.grid_lambdas else []
