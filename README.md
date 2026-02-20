@@ -87,19 +87,19 @@ The Gradio application downloads the checkpoint at runtime on first launch.
 
 # Running Locally
 
-1) Clone repo
-`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`
+1) Clone repo  
+`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
 `cd dl_seg_class_project/deployment/space`
 
-2) Install dependencies
+2) Install dependencies  
 `pip install -r requirements.txt`
 
-3) Run app
+3) Run app  
 `python app.py`
 
 Open: http://localhost:7860
 
-# Docker Deployment
+# Docker Deployment  
 ```
 cd deployment/space
 docker build -t cell-seg .
