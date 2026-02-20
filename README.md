@@ -87,22 +87,22 @@ The Gradio application downloads the checkpoint at runtime on first launch.
 
 # Running Locally
 
-1) clone repo  
-`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
+1) Clone repo
+`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`
 `cd dl_seg_class_project/deployment/space`
 
-2) Install dependencies  
+2) Install dependencies
 `pip install -r requirements.txt`
 
-4) Run app  
+3) Run app
 `python app.py`
 
 Open: http://localhost:7860
 
-# Docker Deployment  
+# Docker Deployment
 ```
-cd deploy  
-docker build -t cell-seg .  
+cd deployment/space
+docker build -t cell-seg .
 docker run -p 7860:7860 cell-seg
 ```
 
@@ -155,12 +155,14 @@ dl_seg_class_project/
 ├── README.md                         # Project overview and documentation
 │
 ├── training/                         # Model training pipeline
-│   ├── dh_train_immbst_terwt.py      # Multi-head training (semantic + ternary)
+│   ├── train.py                      # Main training loop + evaluation + CLI
+│   ├── model.py                      # SharedUnetTwoHead architecture
+│   ├── utils.py                      # Constants, metrics, losses, logging helpers
 │   └── scripts/
 │       └── export_manifest_dataset.py  # Dataset manifest + preprocessing utilities
 │
 ├── deployment/                       # Gradio application for inference
-│   └── deploy/
+│   └── space/
 │       ├── app.py                    # Gradio UI + runtime weight download
 │       ├── model.py                  # Model architecture + load_model()
 │       ├── inference.py              # Tiled inference + overlay utilities
