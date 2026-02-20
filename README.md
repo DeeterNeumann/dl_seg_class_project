@@ -1,13 +1,15 @@
-# dl_seg_class_project
-
 # MoNuSAC Nucleus Segmentation and Classification
+
+![Hugging Face Space](https://img.shields.io/badge/🤗%20Space-Live-blue)
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 Whole Slide Histopathology Inference with Deep Learning
 
 **Author:** Deeter Neumann
 
 # Project Overview
-This project develps and deploys a deep learning pipeline for nucleus segmentation and cell type classification in H&E-stained histopathology images. The model is trained on the MoNuSAC dataset and performs inference on whole slide immages (WSIs) using tiled processing and Gaussian blending.
+This project develops and deploys a deep learning pipeline for nucleus segmentation and cell type classification in H&E-stained histopathology images. The model is trained on the MoNuSAC dataset and performs inference on whole slide images (WSIs) using tiled processing and Gaussian blending.
 
 The system demonstrates a full translational pipeline:
 - Data preprocessing and normalization
@@ -16,7 +18,7 @@ The system demonstrates a full translational pipeline:
 - Interactive deployment via Hugging Face Spaces
 
 # Live Demo:
-https://huggingface.com/spaces/drneumann/CellClassification
+https://huggingface.co/spaces/drneumann/CellClassification
 
 # Objectives
 - Segment nuclei in histopathology images
@@ -74,10 +76,18 @@ Hugging Face Spaces provides:
 - Public accessibility
 - Model hosting
 
+# Model Weights
+
+The trained model checkpoint is hosted separately on the Hugging Face Hub to keep the deployment lightweight:
+
+https://huggingface.co/drneumann/monusac-run9-segmentation
+
+The Gradio application downloads the checkpoint at runtime on first launch.
+
 # Running Locally
 
 1) clone repo  
-`ngit clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
+`git clone https://github.com/DeeterNeumann/dl_seg_class_project.git`  
 `cd dl_seg_class_project/deployment/deploy`
 
 2) Install dependencies  
@@ -141,26 +151,30 @@ The model jointly predicts semantic nucleus class (5-class) and ternary structur
 # Repository Structure
 ```
 dl_seg_class_project/
-├── deploy/                     # Hugging Face Spaces app (Docker + Gradio UI)
-│   ├── app.py                  # Web interface for WSI inference
-│   ├── inference.py            # Tiled inference & overlay logic
-│   ├── model.py                # Model architecture & loading
-│   ├── requirements.txt        # Deployment dependencies
-│   └── weights/                # Model checkpoints (Git LFS)
+├── README.md                         # Project overview and documentation
 │
-├── scripts/                    # Data preparation & experiment utilities
-│   ├── export_manifest_dataset.py
-│   └── other pipeline helpers
+├── training/                         # Model training pipeline
+│   ├── dh_train_immbst_terwt.py      # Multi-head training (semantic + ternary)
+│   ├── dh_train_immune_boost.py      # Immune-aware training variant
+│   └── scripts/
+│       └── export_manifest_dataset.py  # Dataset manifest + preprocessing utilities
 │
-├── assets/                     # Project assets (configs, metadata)
+├── deployment/                       # Gradio application for inference
+│   └── deploy/
+│       ├── app.py                    # Gradio UI + runtime weight download
+│       ├── model.py                  # Model architecture + load_model()
+│       ├── inference.py              # Tiled inference + overlay utilities
+│       ├── requirements.txt          # Space dependencies
+│       ├── Dockerfile                # HF Space container configuration
+│       └── weights/                  # Runtime-downloaded model checkpoint
 │
-├── dh_train_immune_boost.py    # Primary training script (multi-head model)
-├── dh_train_immbst_terwt.py    # Training variant (boundary weighting ablation)
-├── summarize_runs.py           # Training metrics aggregation
-├── generate_summary_doc.py     # Automated results report generation
-├── download_from_lightning.sh  # Artifact retrieval from Lightning runs
-├── training_run_summary.pdf    # Capstone results summary
+├── assets/                           # Static project artifacts
+│   ├── class_weights.json            # Semantic class weighting (training)
+│   ├── examples/                     # Example images (downloaded by Space)
+│   ├── figures/                      # Training dashboards and plots
+│   └── reports/
+│       └── training_run_summary.pdf  # Final capstone report
 │
-├── .gitignore
-└── README.md
+└── download_from_lightning.sh        # Utility for pulling checkpoints from Lightning
+```
    
